@@ -2429,6 +2429,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bincode",
+ "bumpalo",
  "clap",
  "needletail",
  "xorf",
