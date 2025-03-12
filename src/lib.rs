@@ -102,7 +102,6 @@ impl KmerCounter {
             let output_rx = output_rx.clone();
             let shutdown_flag = shutdown_flag.clone();
             let bins = bins.clone();
-            let temp_path = temp_path.to_str().unwrap().to_string();
             let worker = thread::spawn(move || {
                 kmer_worker(kmer_rx, compression_rx, compression_tx, output_rx, output_tx, shutdown_flag, bins, bin_power);
             });
@@ -229,16 +228,7 @@ fn kmer_worker(
         }
 
         let kmers = match kmer_rx.try_recv() {
-            Err(crossbeam::channel::TryRecvError::Empty) => {
-                if backoff.is_completed() {
-                    // Sleep for 100ms
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    backoff.reset();
-                } else {
-                    backoff.snooze();
-                }
-                continue;
-            }
+            Err(crossbeam::channel::TryRecvError::Empty) => continue,
             Err(crossbeam::channel::TryRecvError::Disconnected) => break,
             Ok(kmers) => kmers,
         };
