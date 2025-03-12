@@ -1,7 +1,7 @@
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
-use growable_bloom_filter::GrowableBloom;
+// use growable_bloom_filter::GrowableBloom;
 use needletail::{Sequence, parse_fastx_file};
 use pulp::Arch;
 use xxhash_rust::xxh3::xxh3_64;
@@ -129,7 +129,6 @@ impl KmerCounter {
                         .collect();
 
                     for bin in bins_to_flush {
-                        println!("Flushing bin {}", bin);
                         let mut bin_lock = bins[bin].buffer.lock().unwrap();
                         let mut bin_buffer = Vec::with_capacity(bin_lock.len());
                         std::mem::swap(&mut *bin_lock, &mut bin_buffer);
