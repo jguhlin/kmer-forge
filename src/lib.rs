@@ -225,7 +225,7 @@ fn kmer_worker(
 
     let backoff = crossbeam::utils::Backoff::new();
     let bin_mask = (1 << bin_power) - 1;
-    const FLUSH_THRESHOLD: usize = 2048;
+    const FLUSH_THRESHOLD: usize = 4096;
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
@@ -300,7 +300,7 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     // -> (u64, KmerCounter) {
     let mut count = 0;
     let mut reader = parse_fastx_file(file).expect("Invalid file");
-    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 256 * 1024, 8);
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 512 * 1024, 8);
 
     println!("Kmer counter created");
 
@@ -374,9 +374,9 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
             kmers_to_submit.push(rolling_encoder.code);
         }
 
-        if kmers_to_submit.len() >= 32 * 1024 {
+        if kmers_to_submit.len() >= 64 * 1024 {
             kmer_counter.submit(kmers_to_submit);
-            kmers_to_submit = Vec::with_capacity(32 * 1024);
+            kmers_to_submit = Vec::with_capacity(64 * 1024);
         }
     }
 
