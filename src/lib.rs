@@ -87,9 +87,9 @@ impl KmerCounter {
         let bins = Arc::new(bins);
 
         // Create the channels
-        let (kmer_tx, kmer_rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(256);
-        let (compression_tx, compression_rx): (Sender<(usize, Vec<u64>)>, Receiver<(usize, Vec<u64>)>) = bounded(256);
-        let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(256);
+        let (kmer_tx, kmer_rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(64);
+        let (compression_tx, compression_rx): (Sender<(usize, Vec<u64>)>, Receiver<(usize, Vec<u64>)>) = bounded(64);
+        let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = unbounded();
 
         // Create the workers
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -216,9 +216,7 @@ fn kmer_worker(
 
                 // lz4_flex
                 // let compressed = compress(&encoded);
-                if output_tx.len() as f32 >= 0.8 * output_tx.capacity().unwrap() as f32 {
-                    println!("Output channel 80% full");
-                }
+
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
             Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
@@ -270,7 +268,7 @@ fn kmer_worker(
             }
         }
 
-        if !bins_to_submit.is_empty() {
+        if !bins_to_submit.is_empty() && !compression_rx.is_full() {
             for bin in bins_to_submit.drain(..) {
                 let mut bin_lock = match bins[bin].buffer.try_lock() {
                     Ok(lock) => lock,
@@ -293,6 +291,8 @@ fn kmer_worker(
                 compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
             }
         }
+
+        bins_to_submit.clear();
     }
 
     // Final flush: after shutdown, flush any remaining items from the thread-local buffers.
