@@ -1,186 +1,281 @@
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
+use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
+use growable_bloom_filter::GrowableBloom;
 use needletail::{Sequence, parse_fastx_file};
-use std::{borrow::Cow, collections::HashMap};
+use pulp::Arch;
+use rayon::prelude::*;
+use xxhash_rust::xxh3::xxh3_64;
 
-enum KmerStorage {
-    Singleton,
-    LowFreq,
-    HighFreq,
-}
+use std::borrow::Cow;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::{self, JoinHandle};
+
+mod utils;
+
+use utils::*;
 
 pub struct KmerCounter {
-    kmers: Vec<(u64, Vec<u8>, usize, KmerStorage)>, // hash, kmer, index, storage loc
-    buffer: Vec<Vec<u8>>,
-    // Singletons don't need to be stored!
-    low_freq: Vec<(Vec<u8>, u8)>,
-
-    high_freq: Vec<(Vec<u8>, u64)>,
-
-    // clean-up count
-    clean_up: u64,
-
-    // todo: reuse low freq indices when they move to high freq?
-    // But after 640k reads only 4.6k high freq kmers
-    // so probably not worth it
+    k: u8,
+    temp_path: String,
+    bins: Arc<Vec<KmerBin>>,
+    bin_count: u16,
+    threads: usize,
+    workers: Vec<JoinHandle<()>>,
+    tx: Sender<Vec<u64>>,
+    shutdown_flag: Arc<AtomicBool>,
+    flusher_thread: JoinHandle<()>,
+    needs_flush: Arc<Vec<AtomicBool>>,
 }
 
 impl KmerCounter {
-    pub fn new() -> Self {
+    pub fn new(
+        k: u8,
+        temp_path: String,
+        threads: usize,
+        buffer_flush_size: usize,
+        bin_power: u8,
+    ) -> Self {
+        assert!(k < 32, "Kmer size must be less than 32");
+        let bin_count: usize = 2_usize.pow(bin_power as u32);
+        assert!(bin_count > 0, "Bin count must be greater than 0");
+        assert!(
+            bin_count < u16::MAX as usize,
+            "Bin count must be less than u16::MAX"
+        );
+
+        let mut bins = Vec::with_capacity(bin_count as usize);
+
+        // Confirm temp_path is writable, and create the directory if it doesn't exist
+        let temp_path = std::path::Path::new(&temp_path);
+        if !temp_path.exists() {
+            std::fs::create_dir(temp_path).expect("Could not create temp directory");
+        }
+
+        // Confirm the temp_path is empty
+        let temp_path = temp_path.to_str().unwrap();
+        let temp_path = format!("{}/", temp_path);
+        let temp_path = std::path::Path::new(&temp_path);
+        if temp_path.read_dir().unwrap().count() > 0 {
+            panic!("Temp directory is not empty");
+        }
+
+        // Create the bins
+        for i in 0..bin_count {
+            let bin_path = format!(
+                "{}/bin_{}.kmer_forge_temp_bin",
+                temp_path.to_str().unwrap(),
+                i
+            );
+            let out_fh = BufWriter::new(File::create(bin_path).expect("Could not create bin file"));
+            let out_fh = Mutex::new(out_fh);
+            bins.push(KmerBin {
+                number: i as u16,
+                out_fh,
+                buffer: Mutex::new(Vec::with_capacity(buffer_flush_size)),
+                buffer_flush_size,
+            });
+        }
+
+        let bins = Arc::new(bins);
+        let needs_flush: Arc<Vec<AtomicBool>> = Arc::new((0..bin_count).map(|_| AtomicBool::new(false)).collect());
+
+        // Create the channels
+        let (tx, rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(8192);
+
+        // Create the workers
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let rx = rx.clone();
+            let shutdown_flag = shutdown_flag.clone();
+            let bins = bins.clone();
+            let temp_path = temp_path.to_str().unwrap().to_string();
+            let needs_flush = needs_flush.clone();
+            let worker = thread::spawn(move || {
+                kmer_worker(rx, shutdown_flag, temp_path, bins, bin_power, needs_flush);
+            });
+            workers.push(worker);
+        }
+
+        let flusher_thread = {
+            let bins = bins.clone();
+            let needs_flush = needs_flush.clone();
+            thread::spawn(move || {
+                let mut bump = Bump::new();
+                let backoff = crossbeam::utils::Backoff::new();
+                backoff.snooze();
+                loop {
+                    if shutdown_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Check if any bins need flushing
+                    // Find indexes of bins that need flushing
+                    let bins_to_flush: Vec<usize> = needs_flush
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, b)| {
+                            if b.load(Ordering::Relaxed) {
+                                b.store(false, Ordering::Relaxed);
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    for bin in bins_to_flush {
+                        println!("Flushing bin {}", bin);
+                        let mut bin_lock = bins[bin].buffer.lock().unwrap();
+                        let mut bin_buffer = Vec::with_capacity(bin_lock.len());
+                        std::mem::swap(&mut *bin_lock, &mut bin_buffer);
+                        drop(bin_lock);
+
+                        let encoded =
+                            bump.alloc_with(|| bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
+                                .expect("Could not write to bin file"));
+                        let compressed = bump.alloc_with(|| zstd::bulk::compress(&encoded, -3)
+                            .expect("Could not compress buffer"));
+
+                        let mut bin_lock = bins[bin].out_fh.lock().unwrap();
+                        bincode::encode_into_std_write(
+                            &*compressed,
+                            &mut *bin_lock,
+                            bincode::config::standard(),
+                        )
+                        .expect("Could not write to bin file");
+                        drop(bin_lock);
+                        bump.reset();
+                    }
+
+                    backoff.snooze();
+                }
+
+                // Out of the loop? Then flush all the buffers regardless of size
+                for bin in bins.iter() {
+                    println!("Flushing bin {}", bin.number);
+                        let mut bin_lock = bin.buffer.lock().unwrap();
+                        let mut bin_buffer = Vec::with_capacity(bin_lock.len());
+                        std::mem::swap(&mut *bin_lock, &mut bin_buffer);
+                        drop(bin_lock);
+
+                        let encoded =
+                            bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
+                                .expect("Could not write to bin file");
+                        let compressed = zstd::bulk::compress(&encoded, -3)
+                            .expect("Could not compress buffer");
+
+                        let mut bin_lock = bin.out_fh.lock().unwrap();
+                        bincode::encode_into_std_write(
+                            &compressed,
+                            &mut *bin_lock,
+                            bincode::config::standard(),
+                        )
+                        .expect("Could not write to bin file");
+                        drop(bin_lock);
+                }
+            })
+        };
+
         KmerCounter {
-            kmers: Vec::with_capacity(64 * 1024 * 1024),
-            buffer: Vec::with_capacity(1024 * 1024),
-            low_freq: Vec::new(),
-            high_freq: Vec::new(),
-            clean_up: 32 * 1024 * 1024, // By default, clean up every 1024 reads
+            k,
+            temp_path: temp_path.to_str().unwrap().to_string(), // stupid....
+            bins,
+            bin_count: bin_count as u16,
+            threads,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            workers,
+            tx,
+            flusher_thread,
+            needs_flush,
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.kmers.len()
+    pub fn submit(&self, kmers: Vec<u64>) {
+        self.tx.send(kmers).expect("Could not send kmers to worker");
     }
 
-    pub fn buffer_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    pub fn record_from_iter(&mut self, kmers: impl Iterator<Item = Vec<u8>>) {
-        self.buffer.extend(kmers);
-
-        if self.buffer.len() > self.clean_up as usize {
-            self.process_buffer();
+    pub fn shutdown(&mut self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        for _ in 0..self.threads {
+            self.tx
+                .send(Vec::new())
+                .expect("Could not send shutdown signal to worker");
+        }
+        for worker in self.workers.drain(..) {
+            worker.join().expect("Could not join worker thread");
         }
     }
+}
 
-    pub fn record_kmer(&mut self, kmer: &[u8]) {
-        let mut kmer_b = Vec::default();
-        kmer_b.extend_from_slice(kmer);
-        self.buffer.push(kmer_b);
+fn kmer_worker(
+    rx: crossbeam::channel::Receiver<Vec<u64>>,
+    shutdown_flag: Arc<AtomicBool>,
+    temp_path: String,
+    bins: Arc<Vec<KmerBin>>,
+    bin_power: u8,
+    needs_flush: Arc<Vec<AtomicBool>>,
+) {
+    let backoff = crossbeam::utils::Backoff::new();
+    let bin_mask = (1 << bin_power) - 1;
 
-        if self.buffer.len() > self.clean_up as usize {
-            self.process_buffer();
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            break;
         }
-    }
 
-    pub fn process_buffer(&mut self) {
-
-        println!("Processing Buffer");
-        self.buffer.sort_unstable();
-
-        println!("Counting");
-        // Count kmers in buffer
-        // Buffer is sorted, so we can count them in one pass
-        let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
-        let mut last_kmer: Option<&[u8]> = None;
-        for kmer in &self.buffer {
-            if Some(kmer.as_slice()) == last_kmer {
-                *counts.get_mut(kmer).unwrap() += 1;
-            } else {
-                counts.insert(kmer.clone(), 1);
+        let kmers = match rx.try_recv() {
+            Err(crossbeam::channel::TryRecvError::Empty) => {
+                backoff.snooze();
+                continue;
             }
-            last_kmer = Some(kmer.as_slice());
-        }
-        
-        println!("Counted {} kmers", counts.len());
+            Err(crossbeam::channel::TryRecvError::Disconnected) => break,
+            Ok(kmers) => kmers,
+        };
 
-        // todo generate entries in a separate vec, then add and sort all at once later
+        let kmers = kmers;
+        let mut kmers_with_bin: Vec<(u64, u64)> = kmers
+            .into_iter()
+            .map(|kmer| {
+                let hash = xxh3_64(&kmer.to_ne_bytes());
+                let bin = hash & bin_mask;
+                (bin, kmer)
+            })
+            .collect();
 
-        let mut kmer_additions: Vec<(u64, Vec<u8>, usize, KmerStorage)> = Vec::new();
+        // Sort into thread local bins
+        kmers_with_bin.par_sort_unstable_by_key(|(bin, _)| *bin);
 
-        // Process counts
-        for (kmer, count) in counts {
-            let x_hash = xxhash_rust::xxh3::xxh3_64(&kmer);
+        let mut cur_bin = kmers_with_bin[0].0;
+        let mut bin_lock = bins[cur_bin as usize].buffer.lock().expect("Could not acquire bin lock");
 
-            // Find kmer in kmer list
-            match self
-                .kmers
-                .binary_search_by(|(hash, _, _, _)| hash.cmp(&x_hash))
-            {
-                Ok(i) => {
-                    // Kmer already exists
-                    match self.kmers[i].3 {
-                        KmerStorage::Singleton => {
-                            // If singleton, move to low freq
-                            if count <= u8::MAX as u64 {
-                                self.kmers[i].3 = KmerStorage::LowFreq;
-                                let index = self.low_freq.len();
-                                self.low_freq
-                                    .push((self.kmers[i].1.clone(), 1 + count as u8));
-                                self.kmers[i].2 = index;
-                            } else {
-                                let index = self.high_freq.len();
-                                self.kmers[i].3 = KmerStorage::HighFreq;
-                                self.kmers[i].2 = index;
-                                self.high_freq.push((self.kmers[i].1.clone(), 1 + count));
-                            }
-                        }
-                        KmerStorage::LowFreq => {
-                            // If low freq, increment count
-
-                            // Confirm it will remain low freq
-                            // todo: now it's duplicated in both low and high freq
-                            let index = self.kmers[i].2;
-                            if self.low_freq[index].1 as u64 + count > u8::MAX as u64 {
-                                let index = self.high_freq.len();
-                                self.kmers[i].2 = index;
-                                self.kmers[i].3 = KmerStorage::HighFreq;
-                                self.high_freq.push((
-                                    self.kmers[i].1.clone(),
-                                    self.low_freq[index].1 as u64 + count,
-                                ));
-                                // Do not remove as it changes the index
-                            } else {
-                                self.low_freq[index].1 += count as u8;
-                            }
-                        }
-                        KmerStorage::HighFreq => {
-                            let index = self.kmers[i].2;
-                            // If high freq, increment count
-                            self.high_freq[index].1 += count;
-                        }
-                    }
+        // First pass: iterate over each kmer and try a non-blocking lock.
+        for (bin, kmer) in kmers_with_bin {
+            if bin != cur_bin {
+                if bin_lock.len() > bins[cur_bin as usize].buffer_flush_size {
+                    needs_flush[bin as usize].store(true, Ordering::Relaxed);
                 }
-                Err(i) => {
-                    // Kmer does not exist
-                    if count == 1 {
-                        // If singleton, don't store
-                        kmer_additions.push((x_hash, kmer.to_vec(), 0, KmerStorage::Singleton));
-                    } else {
-                        // If not singleton, store
-                        if count <= u8::MAX as u64 {
-                            let index = self.low_freq.len();
-                            self.low_freq.push((kmer.to_vec(), 1 + count as u8));
-                            kmer_additions.push((x_hash, kmer.to_vec(), index, KmerStorage::LowFreq));
-                            
-                        } else {
-                            let index = self.high_freq.len();
-                            kmer_additions.push((x_hash, kmer.to_vec(), index, KmerStorage::HighFreq));
-                            self.high_freq.push((kmer.to_vec(), 1 + count));
-                        }
-                    }
-                }
+                drop(bin_lock);
+
+                bin_lock = bins[bin as usize].buffer.lock().expect("Could not acquire bin lock");
+                cur_bin = bin;
             }
+
+            bin_lock.push(kmer);
         }
-
-        println!("Adding {} kmers", kmer_additions.len());
-        self.kmers.extend(kmer_additions);
-
-
-        println!("Sorting kmers");
-        // Sort kmers
-        self.kmers.sort_unstable_by(|(hash1, _, _, _), (hash2, _, _, _)| hash1.cmp(hash2));
-
-        println!("Sorted kmers");
-
-        // Clear buffer
-        self.buffer.clear();
-
-        println!("Processed {} kmers", self.kmers.len());
-        println!("Singletons: {}", self.kmers.len() - self.low_freq.len() - self.high_freq.len());
-        println!("Low Freq: {}", self.low_freq.len());
-        println!("High Freq: {}", self.high_freq.len());
-        
+        drop(bin_lock);
     }
+}
+
+pub struct KmerBin {
+    number: u16,
+    out_fh: Mutex<BufWriter<std::fs::File>>,
+    buffer: Mutex<Vec<u64>>,
+    buffer_flush_size: usize,
 }
 
 // Returns
@@ -188,13 +283,18 @@ impl KmerCounter {
 // 1: Hashmap Kmer, Count
 
 // kmers up to 255
-pub fn parse_file(file: &str, k: u8, min_quality: u8) -> (u64, KmerCounter) {
+pub fn parse_file(file: &str, k: u8, min_quality: u8) {
+    // -> (u64, KmerCounter) {
     let mut count = 0;
-    let mut kmer_counter = KmerCounter::new();
     let mut reader = parse_fastx_file(file).expect("Invalid file");
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 16, 512 * 1024, 8);
+
+    println!("Kmer counter created");
 
     // debugging
     let mut processed_reads = 0;
+
+    let mut kmers_to_submit = Vec::with_capacity(32 * 1024);
 
     while let Some(record) = reader.next() {
         processed_reads += 1;
@@ -235,11 +335,37 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) -> (u64, KmerCounter) {
 
         let rc = seq.reverse_complement();
 
-        kmer_counter.record_from_iter(seq.kmers(k).map(|kmer| kmer.to_vec()));
-        kmer_counter.record_from_iter(rc.kmers(k).map(|kmer| kmer.to_vec()));
+        let mut kmers = seq.kmers(k);
+        let mut rolling_encoder =
+            RollingKmer3::new(&kmers.next().unwrap(), k as usize).expect("Sequence too short");
+        // Add the first code to the vec
+        kmers_to_submit.push(rolling_encoder.code);
+        // Roll the rest
+        for kmer in kmers {
+            rolling_encoder.roll(kmer[k as usize - 1]);
+            kmers_to_submit.push(rolling_encoder.code);
+        }
+
+        let mut rc_kmers = rc.kmers(k);
+        let mut rolling_encoder =
+            RollingKmer3::new(&rc_kmers.next().unwrap(), k as usize).expect("Sequence too short");
+        // Add the first code to the vec
+        kmers_to_submit.push(rolling_encoder.code);
+        // Roll the rest
+        for kmer in rc_kmers {
+            rolling_encoder.roll(kmer[k as usize - 1]);
+            kmers_to_submit.push(rolling_encoder.code);
+        }
+
+        if kmers_to_submit.len() >= 32 * 1024 {
+            kmer_counter.submit(kmers_to_submit);
+            kmers_to_submit = Vec::with_capacity(32 * 1024);
+        }
     }
 
-    (count, kmer_counter)
+    kmer_counter.shutdown();
+
+    // (count, kmer_counter)
 }
 
 #[cfg(test)]
@@ -247,7 +373,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kmer_counts() {
-        
+    fn rolling_kmer() {
+        let k: usize = 21;
+        // Example sequence: must be at least k nucleotides.
+        let seq = b"AACGTNACGTNACGTNACGTN"; // exactly 21 nucleotides
+        let mut rk = RollingKmer3::new(seq, k).expect("Sequence too short");
+        println!("Initial encoding: {:#018x}", rk.code);
+
+        // Roll the k-mer: remove the leftmost nucleotide ('A') and append 'T'.
+        rk.roll(b'T');
+        println!("After rolling:   {:#018x}", rk.code);
+
+        // Roll the k-mer: remove the leftmost nucleotide ('C') and append 'G'.
+        rk.roll(b'G');
+
+        // Start a new one to confirm that the previous one was rolled correctly.
+        let mut rk2 = RollingKmer3::new(b"CGTNACGTNACGTNACGTNTG", k).expect("Sequence too short");
+        println!("Initial encoding: {:#018x}", rk2.code);
+
+        assert!(rk.code == rk2.code);
+
+        // Now for k=9
+        let k: usize = 9;
+        let seq = b"ACGTNACGT";
+        let mut rk = RollingKmer3::new(seq, k).expect("Sequence too short");
+        rk.roll(b'G');
+        rk.roll(b'C');
+
+        let mut rk2 = RollingKmer3::new(b"GTNACGTGC", k).expect("Sequence too short");
+        assert!(rk.code == rk2.code);
     }
 }
