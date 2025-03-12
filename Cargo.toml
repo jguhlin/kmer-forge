@@ -11,6 +11,7 @@ bytecount = { version = "0.6.8", features = ["runtime-dispatch-simd"] }
 # clap = { version = "4.5.31", features = ["derive"] }
 # criterion = "0.5.1"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+indicatif = "0.17.11"
 lz4_flex = { version = "0.11.3", default-features = false }
 # growable-bloom-filter = "2.1.1"
 needletail = "0.6.3"

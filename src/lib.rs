@@ -183,7 +183,6 @@ fn kmer_worker(
     bin_power: u8,
 ) {
 
-    let backoff = crossbeam::utils::Backoff::new();
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 8192;
 
@@ -205,7 +204,8 @@ fn kmer_worker(
         match compression_rx.try_recv() {
             Ok((bin, kmers)) => {
                 let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
-                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+                // let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+                let compressed = compress(&encoded);
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
             Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
