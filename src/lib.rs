@@ -187,7 +187,7 @@ fn kmer_worker(
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 8192;
 
-    let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
+    let mut compressor = zstd::bulk::Compressor::new(3).expect("Could not create compressor");
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
