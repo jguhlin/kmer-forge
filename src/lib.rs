@@ -208,26 +208,28 @@ fn kmer_worker(
             break;
         }
 
-        match compression_rx.try_recv() {
-            Ok((bin, mut kmers)) => {
-                kmers.sort_unstable();
+        if !output_rx.is_full() {
+            match compression_rx.try_recv() {
+                Ok((bin, mut kmers)) => {
+                    kmers.sort_unstable();
 
-                let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
+                    let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
 
-                // zstd
-                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+                    // zstd
+                    let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
 
-                // lz4_flex
-                // let compressed = compress(&encoded);
+                    // lz4_flex
+                    // let compressed = compress(&encoded);
 
-                // no compression
-                // No real speed difference...
-                // let compressed = encoded;
+                    // no compression
+                    // No real speed difference...
+                    // let compressed = encoded;
 
-                output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
-            },
-            Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
-            Err(crossbeam::channel::TryRecvError::Empty) => {}, // Do nothing, continue on
+                    output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
+                },
+                Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
+                Err(crossbeam::channel::TryRecvError::Empty) => {}, // Do nothing, continue on
+            }
         }
 
         match output_rx.try_recv() {
