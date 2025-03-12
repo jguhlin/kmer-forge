@@ -187,7 +187,7 @@ fn kmer_worker(
     const FLUSH_THRESHOLD: usize = 8192;
 
     let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
-
+    
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
     let mut local_buffers: Vec<Vec<u64>> = (0..bin_count)
@@ -197,6 +197,12 @@ fn kmer_worker(
     let mut bins_to_submit = Vec::with_capacity(128);
 
     loop {
+
+        // Print channel sizes
+        println!("Kmer channel: {}", kmer_rx.len());
+        println!("Compression channel: {}", compression_rx.len());
+        println!("Output channel: {}", output_rx.len());
+
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -287,7 +293,6 @@ fn kmer_worker(
                 }
 
                 compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
-
             }
         }
     }
