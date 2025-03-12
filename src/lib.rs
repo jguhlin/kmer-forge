@@ -268,7 +268,7 @@ fn kmer_worker(
             }
         }
 
-        if !bins_to_submit.is_empty() && !compression_rx.is_full() {
+        if !bins_to_submit.is_empty() && compression_rx.len() as f32 <= 0.8 * compression_rx.capacity().unwrap() as f32 {
             for bin in bins_to_submit.drain(..) {
                 let mut bin_lock = match bins[bin].buffer.try_lock() {
                     Ok(lock) => lock,
@@ -283,10 +283,6 @@ fn kmer_worker(
                 let mut bin_buffer = Vec::with_capacity(bin_lock.len());
                 std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                 drop(bin_lock);
-
-                if compression_tx.len() as f32 >= 0.8 * compression_tx.capacity().unwrap() as f32 {
-                    println!("Compression channel 80% full");
-                }
 
                 compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
             }
