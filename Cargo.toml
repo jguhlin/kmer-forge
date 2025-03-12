@@ -4,4 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# bevy = { version = "0.15.3", default-features = false, features = ["async-io", "bevy_asset", "bevy_core_pipeline", "bevy_gizmos", "bevy_picking", "bevy_remote", "bevy_render", "bevy_state", "bevy_text", "bevy_ui", "bevy_window", "bevy_winit", "default_font", "multi_threaded", "png", "x11"] }
+bincode = "2.0.1"
+bumpalo = { version = "3.17.0", features = ["collections", "allocator_api", "std"] }
+bytecount = { version = "0.6.8", features = ["runtime-dispatch-simd"] }
+clap = { version = "4.5.31", features = ["derive"] }
+criterion = "0.5.1"
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+growable-bloom-filter = "2.1.1"
 needletail = "0.6.3"
+pulp = "0.21.4"
+rayon = "1.10.0"
+xorf = "0.11.0"
+xxhash-rust = { version = "0.8.15", features = ["std", "xxh3", "const_xxh3"] }
+zstd = { version = "0.13.3", features = ["fat-lto"] }
+
+[[example]]
+name = "count_kmers"
+path = "examples/count_kmers.rs"
