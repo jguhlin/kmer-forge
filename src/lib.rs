@@ -126,6 +126,11 @@ impl KmerCounter {
     }
 
     pub fn submit(&self, kmers: Vec<u64>) {
+
+        if self.kmer_tx.len() as f32 >= 0.8 * self.kmer_tx.capacity().unwrap() as f32 {
+            println!("Kmer channel 80% full");
+        }
+
         self.kmer_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
@@ -197,12 +202,6 @@ fn kmer_worker(
     let mut bins_to_submit = Vec::with_capacity(128);
 
     loop {
-
-        // Print channel sizes
-        println!("Kmer channel: {}", kmer_rx.len());
-        println!("Compression channel: {}", compression_rx.len());
-        println!("Output channel: {}", output_rx.len());
-
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -218,8 +217,8 @@ fn kmer_worker(
 
                 // lz4_flex
                 // let compressed = compress(&encoded);
-                if output_tx.len() == output_tx.capacity().unwrap() {
-                    println!("Output channel full");
+                if output_tx.len() as f32 >= 0.8 * output_tx.capacity().unwrap() as f32 {
+                    println!("Output channel 80% full");
                 }
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
@@ -288,8 +287,8 @@ fn kmer_worker(
                 std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                 drop(bin_lock);
 
-                if compression_tx.len() == compression_tx.capacity().unwrap() {
-                    println!("Compression channel full");
+                if compression_tx.len() as f32 >= 0.8 * compression_tx.capacity().unwrap() as f32 {
+                    println!("Compression channel 80% full");
                 }
 
                 compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
