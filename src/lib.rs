@@ -2,7 +2,7 @@ use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
 // use growable_bloom_filter::GrowableBloom;
-use needletail::{Sequence, parse_fastx_file};
+use needletail::{Sequence, parse_fastx_file, parse_fastx_reader};
 use pulp::Arch;
 use xxhash_rust::xxh3::xxh3_64;
 use lz4_flex::block::*;
@@ -70,7 +70,7 @@ impl KmerCounter {
                 temp_path.to_str().unwrap(),
                 i
             );
-            let out_fh = BufWriter::new(File::create(bin_path).expect("Could not create bin file"));
+            let out_fh = BufWriter::with_capacity(2 * 1024 * 1024, File::create(bin_path).expect("Could not create bin file"));
             let out_fh = Mutex::new(out_fh);
             bins.push(KmerBin {
                 number: i as u16,
@@ -301,7 +301,10 @@ pub struct KmerBin {
 pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     // -> (u64, KmerCounter) {
     let mut count = 0;
-    let mut reader = parse_fastx_file(file).expect("Invalid file");
+    let file = File::open(file).expect("Could not open file");
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let mut reader = parse_fastx_reader(reader).expect("Invalid file");
+    // let mut reader = parse_fastx_file(file).expect("Invalid file");
     let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 512 * 1024, 8);
 
     println!("Kmer counter created");
