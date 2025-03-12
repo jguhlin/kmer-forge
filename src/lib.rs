@@ -84,7 +84,7 @@ impl KmerCounter {
             Arc::new((0..bin_count).map(|_| AtomicBool::new(false)).collect());
 
         // Create the channels
-        let (tx, rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(8192);
+        let (tx, rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(256);
 
         // Create the workers
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -196,7 +196,7 @@ impl KmerCounter {
 
     pub fn submit(&self, kmers: Vec<u64>) {
         self.tx
-            .try_send(kmers)
+            .send(kmers)
             .expect("Could not send kmers to worker");
     }
 
@@ -225,7 +225,7 @@ fn kmer_worker(
 
     let backoff = crossbeam::utils::Backoff::new();
     let bin_mask = (1 << bin_power) - 1;
-    const FLUSH_THRESHOLD: usize = 8192;
+    const FLUSH_THRESHOLD: usize = 2048;
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
@@ -300,7 +300,7 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     // -> (u64, KmerCounter) {
     let mut count = 0;
     let mut reader = parse_fastx_file(file).expect("Invalid file");
-    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 16, 512 * 1024, 8);
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 256 * 1024, 8);
 
     println!("Kmer counter created");
 
