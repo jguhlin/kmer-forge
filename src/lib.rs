@@ -108,7 +108,7 @@ impl KmerCounter {
             let shutdown_flag = shutdown_flag.clone();
             thread::spawn(move || {
 
-                let mut compressor = zstd::bulk::Compressor::new(-9).expect("Could not create compressor");
+                let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
 
                 let mut bump = Bump::new();
                 let backoff = crossbeam::utils::Backoff::new();
@@ -312,7 +312,7 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     // debugging
     let mut processed_reads = 0;
 
-    let mut kmers_to_submit = Vec::with_capacity(128 * 1024);
+    let mut kmers_to_submit = Vec::with_capacity(16 * 1024);
 
     while let Some(record) = reader.next() {
         processed_reads += 1;
@@ -379,9 +379,9 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
             kmers_to_submit.push(rolling_encoder.code);
         }
 
-        if kmers_to_submit.len() >= 64 * 1024 {
+        if kmers_to_submit.len() >= 16 * 1024 {
             kmer_counter.submit(kmers_to_submit);
-            kmers_to_submit = Vec::with_capacity(64 * 1024);
+            kmers_to_submit = Vec::with_capacity(16 * 1024);
         }
     }
 
