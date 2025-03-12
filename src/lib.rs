@@ -187,7 +187,7 @@ fn kmer_worker(
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 8192;
 
-    let mut compressor = zstd::bulk::Compressor::new(3).expect("Could not create compressor");
+    let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
@@ -307,14 +307,14 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut reader = parse_fastx_reader(reader).expect("Invalid file");
     // let mut reader = parse_fastx_file(file).expect("Invalid file");
-    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 128 * 1024, 8);
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 512 * 1024, 8);
 
     println!("Kmer counter created");
 
     // debugging
     let mut processed_reads = 0;
 
-    let mut kmers_to_submit = Vec::with_capacity(16 * 1024);
+    let mut kmers_to_submit = Vec::with_capacity(8 * 1024);
 
     while let Some(record) = reader.next() {
         processed_reads += 1;
@@ -381,9 +381,9 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
             kmers_to_submit.push(rolling_encoder.code);
         }
 
-        if kmers_to_submit.len() >= 16 * 1024 {
+        if kmers_to_submit.len() >= 8 * 1024 {
             kmer_counter.submit(kmers_to_submit);
-            kmers_to_submit = Vec::with_capacity(16 * 1024);
+            kmers_to_submit = Vec::with_capacity(8 * 1024);
         }
     }
 
