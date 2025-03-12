@@ -126,14 +126,13 @@ impl KmerCounter {
     }
 
     pub fn submit(&self, kmers: Vec<u64>) {
-
-        if self.kmer_tx.len() as f32 >= 0.8 * self.kmer_tx.capacity().unwrap() as f32 {
-            println!("Kmer channel 80% full");
-        }
-
         self.kmer_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
+    }
+
+    pub fn try_submit(&self, kmers: Vec<u64>) -> Result<(), crossbeam::channel::TrySendError<Vec<u64>>> {
+        self.kmer_tx.try_send(kmers)
     }
 
     pub fn shutdown(&mut self) {
@@ -402,8 +401,18 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
         }
 
         if kmers_to_submit.len() >= 8 * 1024 {
-            kmer_counter.submit(kmers_to_submit);
-            kmers_to_submit = Vec::with_capacity(8 * 1024);
+            match kmer_counter.try_submit(kmers_to_submit) {
+                Ok(_) => {
+                    kmers_to_submit = Vec::with_capacity(8 * 1024);
+                }
+                Err(crossbeam::channel::TrySendError::Full(kmers)) => {
+                    kmers_to_submit = kmers;
+                }, // Process more reads then...
+                Err(crossbeam::channel::TrySendError::Disconnected(_kmers)) => {
+                    panic!("Kmer counter disconnected before shutdown");
+                },
+            }
+            
         }
     }
 
