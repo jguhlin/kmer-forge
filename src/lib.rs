@@ -135,23 +135,18 @@ impl KmerCounter {
                         std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                         drop(bin_lock);
 
-                        //let encoded = bump.alloc_with(|| {
-                            //bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
-                                //.expect("Could not write to bin file")
-                        //});
-                        //let compressed = bump.alloc_with(|| {
-                            //zstd::bulk::compress(&encoded, -3).expect("Could not compress buffer")
-                        //});
+                        let encoded = bincode::encode_to_vec(&bin_buffer, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
+                        let compressed = zstd::bulk::compress(&encoded, -1).expect("Could not compress buffer");
 
                         let mut bin_lock = bins[bin].out_fh.lock().unwrap();
                         bincode::encode_into_std_write(
-                            &bin_buffer, //&*compressed,
+                            &*compressed,
                             &mut *bin_lock,
-                            bincode::config::standard(),
+                            bincode::config::standard().with_fixed_int_encoding(),
                         )
                         .expect("Could not write to bin file");
                         drop(bin_lock);
-                        bump.reset();
+                        // bump.reset();
                     }
 
                     backoff.snooze();
@@ -226,7 +221,7 @@ fn kmer_worker(
 
     let backoff = crossbeam::utils::Backoff::new();
     let bin_mask = (1 << bin_power) - 1;
-    const FLUSH_THRESHOLD: usize = 4096;
+    const FLUSH_THRESHOLD: usize = 8192;
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();

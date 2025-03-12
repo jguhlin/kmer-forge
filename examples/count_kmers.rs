@@ -7,5 +7,4 @@ fn main() {
 
     // println!("Total reads: {}", count);
     // println!("Unique kmers: {}", kmer_count.len());
-    panic!();
 }
