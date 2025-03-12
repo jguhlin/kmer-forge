@@ -208,43 +208,35 @@ fn kmer_worker(
             break;
         }
 
-        if !output_rx.is_full() {
-            match compression_rx.try_recv() {
-                Ok((bin, mut kmers)) => {
-                    kmers.sort_unstable();
-
-                    let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
-
-                    // zstd
-                    let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
-
-                    // lz4_flex
-                    // let compressed = compress(&encoded);
-
-                    // no compression
-                    // No real speed difference...
-                    // let compressed = encoded;
-
-                    output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
-                },
-                Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
-                Err(crossbeam::channel::TryRecvError::Empty) => {}, // Do nothing, continue on
-            }
+        while let Ok((bin, compressed)) = output_rx.try_recv() {
+            let mut bin_lock = bins[bin].out_fh.lock().unwrap();
+            bincode::encode_into_std_write(
+                compressed,
+                &mut *bin_lock,
+                bincode::config::standard().with_fixed_int_encoding(),
+            )
+            .expect("Could not write to bin file");
+            drop(bin_lock);
         }
 
-        match output_rx.try_recv() {
-            Ok((bin, compressed)) => {
-                let mut bin_lock = bins[bin].out_fh.lock().unwrap();
-                bincode::encode_into_std_write(
-                    compressed,
-                    &mut *bin_lock,
-                    bincode::config::standard().with_fixed_int_encoding(),
-                )
-                .expect("Could not write to bin file");
-                drop(bin_lock);
-            },
-            Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
-            Err(crossbeam::channel::TryRecvError::Empty) => {}, // Do nothing, continue on
+        if !output_rx.is_full() {
+            while let Ok((bin, mut kmers)) = compression_rx.try_recv() {
+                kmers.sort_unstable();
+
+                let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
+
+                // zstd
+                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+
+                // lz4_flex
+                // let compressed = compress(&encoded);
+
+                // no compression
+                // No real speed difference...
+                // let compressed = encoded;
+
+                output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
+            }
         }
 
         let kmers = match kmer_rx.try_recv() {
