@@ -135,17 +135,17 @@ impl KmerCounter {
                         std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                         drop(bin_lock);
 
-                        let encoded = bump.alloc_with(|| {
-                            bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
-                                .expect("Could not write to bin file")
-                        });
-                        let compressed = bump.alloc_with(|| {
-                            zstd::bulk::compress(&encoded, -3).expect("Could not compress buffer")
-                        });
+                        //let encoded = bump.alloc_with(|| {
+                            //bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
+                                //.expect("Could not write to bin file")
+                        //});
+                        //let compressed = bump.alloc_with(|| {
+                            //zstd::bulk::compress(&encoded, -3).expect("Could not compress buffer")
+                        //});
 
                         let mut bin_lock = bins[bin].out_fh.lock().unwrap();
                         bincode::encode_into_std_write(
-                            &*compressed,
+                            &bin_buffer, //&*compressed,
                             &mut *bin_lock,
                             bincode::config::standard(),
                         )
