@@ -106,6 +106,9 @@ impl KmerCounter {
             let needs_flush = needs_flush.clone();
             let shutdown_flag = shutdown_flag.clone();
             thread::spawn(move || {
+
+                let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
+
                 let mut bump = Bump::new();
                 let backoff = crossbeam::utils::Backoff::new();
                 backoff.snooze();
@@ -136,11 +139,12 @@ impl KmerCounter {
                         drop(bin_lock);
 
                         let encoded = bincode::encode_to_vec(&bin_buffer, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
-                        let compressed = zstd::bulk::compress(&encoded, -1).expect("Could not compress buffer");
+                        // let compressed = zstd::bulk::compress(&encoded, -1).expect("Could not compress buffer");
+                        let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
 
                         let mut bin_lock = bins[bin].out_fh.lock().unwrap();
                         bincode::encode_into_std_write(
-                            &*compressed,
+                            compressed,
                             &mut *bin_lock,
                             bincode::config::standard().with_fixed_int_encoding(),
                         )
