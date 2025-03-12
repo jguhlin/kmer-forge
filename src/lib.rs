@@ -190,7 +190,7 @@ fn kmer_worker(
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 16384;
 
-    // let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
+    let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
 
     // did not seem to help
     // compressor.set_parameter(zstd::stream::raw::CParameter::Strategy(zstd::zstd_safe::zstd_sys::ZSTD_strategy::ZSTD_fast)).expect("Could not set compression level");
@@ -215,13 +215,14 @@ fn kmer_worker(
                 let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
 
                 // zstd
-                // let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
 
                 // lz4_flex
                 // let compressed = compress(&encoded);
 
                 // no compression
-                let compressed = encoded;
+                // No real speed difference...
+                // let compressed = encoded;
 
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
