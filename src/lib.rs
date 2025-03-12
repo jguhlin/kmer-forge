@@ -212,6 +212,9 @@ fn kmer_worker(
 
                 // lz4_flex
                 // let compressed = compress(&encoded);
+                if output_tx.len() == output_tx.capacity().unwrap() {
+                    println!("Output channel full");
+                }
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
             Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
@@ -278,6 +281,10 @@ fn kmer_worker(
                 let mut bin_buffer = Vec::with_capacity(bin_lock.len());
                 std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                 drop(bin_lock);
+
+                if compression_tx.len() == compression_tx.capacity().unwrap() {
+                    println!("Compression channel full");
+                }
 
                 compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
 
