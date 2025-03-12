@@ -104,6 +104,7 @@ impl KmerCounter {
         let flusher_thread = {
             let bins = bins.clone();
             let needs_flush = needs_flush.clone();
+            let shutdown_flag = shutdown_flag.clone();
             thread::spawn(move || {
                 let mut bump = Bump::new();
                 let backoff = crossbeam::utils::Backoff::new();
@@ -186,7 +187,7 @@ impl KmerCounter {
             bins,
             bin_count: bin_count as u16,
             threads,
-            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_flag,
             workers,
             tx,
             flusher_thread,
