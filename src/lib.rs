@@ -108,7 +108,7 @@ impl KmerCounter {
             let shutdown_flag = shutdown_flag.clone();
             thread::spawn(move || {
 
-                let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
+                let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
 
                 let mut bump = Bump::new();
                 let backoff = crossbeam::utils::Backoff::new();
@@ -305,7 +305,7 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
     let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut reader = parse_fastx_reader(reader).expect("Invalid file");
     // let mut reader = parse_fastx_file(file).expect("Invalid file");
-    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 512 * 1024, 8);
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 128 * 1024, 8);
 
     println!("Kmer counter created");
 
