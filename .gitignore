@@ -1,3 +1,4 @@
 /target
 *.gz
 *.fasta
+*.kmer_forge_temp_bin

@@ -4,14 +4,13 @@ use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
 use growable_bloom_filter::GrowableBloom;
 use needletail::{Sequence, parse_fastx_file};
 use pulp::Arch;
-use rayon::prelude::*;
 use xxhash_rust::xxh3::xxh3_64;
 
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 mod utils;
@@ -81,7 +80,8 @@ impl KmerCounter {
         }
 
         let bins = Arc::new(bins);
-        let needs_flush: Arc<Vec<AtomicBool>> = Arc::new((0..bin_count).map(|_| AtomicBool::new(false)).collect());
+        let needs_flush: Arc<Vec<AtomicBool>> =
+            Arc::new((0..bin_count).map(|_| AtomicBool::new(false)).collect());
 
         // Create the channels
         let (tx, rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(8192);
@@ -135,11 +135,13 @@ impl KmerCounter {
                         std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                         drop(bin_lock);
 
-                        let encoded =
-                            bump.alloc_with(|| bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
-                                .expect("Could not write to bin file"));
-                        let compressed = bump.alloc_with(|| zstd::bulk::compress(&encoded, -3)
-                            .expect("Could not compress buffer"));
+                        let encoded = bump.alloc_with(|| {
+                            bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
+                                .expect("Could not write to bin file")
+                        });
+                        let compressed = bump.alloc_with(|| {
+                            zstd::bulk::compress(&encoded, -3).expect("Could not compress buffer")
+                        });
 
                         let mut bin_lock = bins[bin].out_fh.lock().unwrap();
                         bincode::encode_into_std_write(
@@ -157,26 +159,24 @@ impl KmerCounter {
 
                 // Out of the loop? Then flush all the buffers regardless of size
                 for bin in bins.iter() {
-                    println!("Flushing bin {}", bin.number);
-                        let mut bin_lock = bin.buffer.lock().unwrap();
-                        let mut bin_buffer = Vec::with_capacity(bin_lock.len());
-                        std::mem::swap(&mut *bin_lock, &mut bin_buffer);
-                        drop(bin_lock);
+                    let mut bin_lock = bin.buffer.lock().unwrap();
+                    let mut bin_buffer = Vec::with_capacity(bin_lock.len());
+                    std::mem::swap(&mut *bin_lock, &mut bin_buffer);
+                    drop(bin_lock);
 
-                        let encoded =
-                            bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
-                                .expect("Could not write to bin file");
-                        let compressed = zstd::bulk::compress(&encoded, -3)
-                            .expect("Could not compress buffer");
-
-                        let mut bin_lock = bin.out_fh.lock().unwrap();
-                        bincode::encode_into_std_write(
-                            &compressed,
-                            &mut *bin_lock,
-                            bincode::config::standard(),
-                        )
+                    let encoded = bincode::encode_to_vec(&bin_buffer, bincode::config::standard())
                         .expect("Could not write to bin file");
-                        drop(bin_lock);
+                    let compressed =
+                        zstd::bulk::compress(&encoded, -3).expect("Could not compress buffer");
+
+                    let mut bin_lock = bin.out_fh.lock().unwrap();
+                    bincode::encode_into_std_write(
+                        &compressed,
+                        &mut *bin_lock,
+                        bincode::config::standard(),
+                    )
+                    .expect("Could not write to bin file");
+                    drop(bin_lock);
                 }
             })
         };
@@ -196,7 +196,9 @@ impl KmerCounter {
     }
 
     pub fn submit(&self, kmers: Vec<u64>) {
-        self.tx.send(kmers).expect("Could not send kmers to worker");
+        self.tx
+            .try_send(kmers)
+            .expect("Could not send kmers to worker");
     }
 
     pub fn shutdown(&mut self) {
@@ -215,13 +217,22 @@ impl KmerCounter {
 fn kmer_worker(
     rx: crossbeam::channel::Receiver<Vec<u64>>,
     shutdown_flag: Arc<AtomicBool>,
-    temp_path: String,
+    _temp_path: String,
     bins: Arc<Vec<KmerBin>>,
     bin_power: u8,
     needs_flush: Arc<Vec<AtomicBool>>,
 ) {
+    use std::mem;
+
     let backoff = crossbeam::utils::Backoff::new();
     let bin_mask = (1 << bin_power) - 1;
+    const FLUSH_THRESHOLD: usize = 8192;
+
+    // Create a thread-local buffer for each bin.
+    let bin_count = bins.len();
+    let mut local_buffers: Vec<Vec<u64>> = (0..bin_count)
+        .map(|_| Vec::with_capacity(FLUSH_THRESHOLD))
+        .collect();
 
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -237,37 +248,40 @@ fn kmer_worker(
             Ok(kmers) => kmers,
         };
 
-        let kmers = kmers;
-        let mut kmers_with_bin: Vec<(u64, u64)> = kmers
-            .into_iter()
-            .map(|kmer| {
-                let hash = xxh3_64(&kmer.to_ne_bytes());
-                let bin = hash & bin_mask;
-                (bin, kmer)
-            })
-            .collect();
+        // For each kmer, calculate the bin and store it in the corresponding local buffer.
+        for kmer in kmers {
+            let hash = xxh3_64(&kmer.to_ne_bytes());
+            let bin = hash & bin_mask;
+            let bin_index = bin as usize;
 
-        // Sort into thread local bins
-        kmers_with_bin.par_sort_unstable_by_key(|(bin, _)| *bin);
+            local_buffers[bin_index].push(kmer);
 
-        let mut cur_bin = kmers_with_bin[0].0;
-        let mut bin_lock = bins[cur_bin as usize].buffer.lock().expect("Could not acquire bin lock");
-
-        // First pass: iterate over each kmer and try a non-blocking lock.
-        for (bin, kmer) in kmers_with_bin {
-            if bin != cur_bin {
-                if bin_lock.len() > bins[cur_bin as usize].buffer_flush_size {
-                    needs_flush[bin as usize].store(true, Ordering::Relaxed);
+            // If the thread-local buffer has reached the threshold, flush it.
+            if local_buffers[bin_index].len() >= FLUSH_THRESHOLD {
+                // Acquire the lock for the global bin buffer.
+                let mut global_buffer = bins[bin_index]
+                    .buffer
+                    .lock()
+                    .expect("Could not acquire bin lock");
+                // Move the local buffer's contents into the global buffer.
+                global_buffer.append(&mut local_buffers[bin_index]);
+                // Optionally, mark for flush if the global buffer exceeds its flush size.
+                if global_buffer.len() > bins[bin_index].buffer_flush_size {
+                    needs_flush[bin_index].store(true, Ordering::Relaxed);
                 }
-                drop(bin_lock);
-
-                bin_lock = bins[bin as usize].buffer.lock().expect("Could not acquire bin lock");
-                cur_bin = bin;
             }
-
-            bin_lock.push(kmer);
         }
-        drop(bin_lock);
+    }
+
+    // Final flush: after shutdown, flush any remaining items from the thread-local buffers.
+    for (bin_index, local_buf) in local_buffers.iter_mut().enumerate() {
+        if !local_buf.is_empty() {
+            let mut global_buffer = bins[bin_index]
+                .buffer
+                .lock()
+                .expect("Could not acquire bin lock");
+            global_buffer.append(local_buf);
+        }
     }
 }
 
@@ -298,12 +312,14 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
 
     while let Some(record) = reader.next() {
         processed_reads += 1;
-        if processed_reads % 10000 == 0 {
+        if processed_reads % 100000 == 0 {
             println!("Processed {} reads", processed_reads);
         }
         let record = record.expect("Error reading record");
         let mut seq = record.seq();
         let qual = record.qual();
+
+        let arch = Arch::new();
 
         if let Some(qual) = qual {
             // If average is less than min_quality, skip
@@ -313,11 +329,13 @@ pub fn parse_file(file: &str, k: u8, min_quality: u8) {
             }
 
             // Otherwise mask sequence when quality is less than min_quality
-            let masked_seq: Vec<u8> = seq
-                .iter()
-                .zip(qual.iter())
-                .map(|(base, q)| if q < &min_quality { b'N' } else { *base })
-                .collect();
+
+            let masked_seq: Vec<u8> = arch.dispatch(|| {
+                seq.iter()
+                    .zip(qual.iter())
+                    .map(|(base, q)| if q < &min_quality { b'N' } else { *base })
+                    .collect()
+            });
 
             seq = Cow::Owned(masked_seq);
         } // If no quality, we don't worry about it
