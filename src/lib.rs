@@ -259,7 +259,10 @@ fn kmer_worker(
 
         if !bins_to_submit.is_empty() {
             for bin in bins_to_submit.drain(..) {
-                let mut bin_lock = bins[bin].buffer.lock().unwrap();
+                let mut bin_lock = match bins[bin].buffer.try_lock() {
+                    Ok(lock) => lock,
+                    Err(_) => continue, // Assume another thread is flushing this buffer
+                };
                 
                 // Confirm that another thread didn't flush it
                 if bin_lock.len() < bins[bin].buffer_flush_size {
