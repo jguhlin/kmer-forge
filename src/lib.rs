@@ -202,10 +202,16 @@ fn kmer_worker(
         }
 
         match compression_rx.try_recv() {
-            Ok((bin, kmers)) => {
+            Ok((bin, mut kmers)) => {
+                kmers.sort_unstable();
+
                 let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
-                // let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
-                let compressed = compress(&encoded);
+
+                // zstd
+                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+
+                // lz4_flex
+                // let compressed = compress(&encoded);
                 output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
             },
             Err(crossbeam::channel::TryRecvError::Disconnected) => break, // Or panic? Something has gone wrong
