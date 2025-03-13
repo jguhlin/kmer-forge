@@ -62,12 +62,8 @@ fn canonical_mmer<'a>(fwd: &'a [u8], rev: &'a [u8]) -> &'a [u8] {
     if rev < fwd { rev } else { fwd }
 }
 
-fn compute_signature(kmer: &[u8], m: usize) -> u64 {
+fn compute_signature(kmer: &[u8], m: usize) -> Vec<u8> {
     let k_len = kmer.len();
-    if k_len < m {
-        // fallback: hash entire
-        return xxh3_64(kmer);
-    }
 
     // 1) encode entire k-mer
     // For big k, do it with pulp in chunks:
@@ -125,15 +121,10 @@ fn compute_signature(kmer: &[u8], m: usize) -> u64 {
         }
     }
 
-    // 4) hash it if found, otherwise fallback
-    if let Some(b) = best {
-        xxh3_64(b)
-    } else {
-        xxh3_64(kmer)
-    }
+    best.unwrap().to_vec()
 }
 
-fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(u64, Vec<u8>)> {
+fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut result = Vec::new();
     if read_seq.len() < k {
         return result;
@@ -173,8 +164,8 @@ pub struct KmerCounter {
     bin_count: u16,
     threads: usize,
     workers: Vec<JoinHandle<()>>,
-    kmer_tx: Sender<Vec<(u64, Vec<u8>)>>,
-    kmer_rx: Receiver<Vec<(u64, Vec<u8>)>>,
+    kmer_tx: Sender<Vec<(Vec<u8>, Vec<u8>)>>,
+    kmer_rx: Receiver<Vec<(Vec<u8>, Vec<u8>)>>,
     compression_tx: Sender<(usize, Vec<Vec<u8>>)>,
     compression_rx: Receiver<(usize, Vec<Vec<u8>>)>,
     output_tx: Sender<(usize, Vec<u8>)>,
@@ -283,7 +274,7 @@ impl KmerCounter {
         }
     }
 
-    pub fn submit(&self, kmers: Vec<(u64, Vec<u8>)>) {
+    pub fn submit(&self, kmers: Vec<(Vec<u8>, Vec<u8>)>) {
         self.kmer_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
@@ -291,8 +282,8 @@ impl KmerCounter {
 
     pub fn try_submit(
         &self,
-        kmers: Vec<(u64, Vec<u8>)>,
-    ) -> Result<(), crossbeam::channel::TrySendError<Vec<(u64, Vec<u8>)>>> {
+        kmers: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), crossbeam::channel::TrySendError<Vec<(Vec<u8>, Vec<u8>)>>> {
         self.kmer_tx.try_send(kmers)
     }
 
@@ -419,7 +410,7 @@ impl KmerCounter {
 }
 
 fn kmer_worker(
-    kmer_rx: crossbeam::channel::Receiver<Vec<(u64, Vec<u8>)>>,
+    kmer_rx: crossbeam::channel::Receiver<Vec<(Vec<u8>, Vec<u8>)>>,
     compression_rx: crossbeam::channel::Receiver<(usize, Vec<Vec<u8>>)>,
     compression_tx: crossbeam::channel::Sender<(usize, Vec<Vec<u8>>)>,
     output_rx: crossbeam::channel::Receiver<(usize, Vec<u8>)>,
@@ -495,9 +486,8 @@ fn kmer_worker(
         };
 
         // For each kmer, calculate the bin and store it in the corresponding local buffer.
-        for (hash, superkmer) in kmers {
-            let bin = hash & bin_mask;
-            let bin_index = bin as usize;
+        for (minimzer, superkmer) in kmers {
+            let bin_index = minimzer[0] as usize & bin_mask;
 
             local_buffers[bin_index].push(superkmer);
 
@@ -613,7 +603,7 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         let seq = seq.strip_returns();
         let seq = seq.normalize(true);
 
-        kmers_to_submit.extend(read_to_superkmers(&seq, k as usize, 8).drain(..));
+        kmers_to_submit.extend(read_to_superkmers(&seq, k as usize, 7).drain(..));
 
         if kmers_to_submit.len() >= 8 * 1024 {
             match kmer_counter.try_submit(kmers_to_submit) {
