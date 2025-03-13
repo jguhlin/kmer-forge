@@ -5,6 +5,7 @@ use pulp::Arch;
 use xxhash_rust::xxh3::xxh3_64;
 use rayon::prelude::*;
 
+use std::collections::VecDeque;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
@@ -87,10 +88,103 @@ fn is_bad(mmer: &[u8]) -> bool {
     false
 }
 
-#[inline(always)]
-fn canonical_mmer<'a>(fwd: &'a [u8], rev: &'a [u8]) -> &'a [u8] {
-    if rev < fwd { rev } else { fwd }
+pub struct RollingMinimizer {
+    // a queue of the candidate m‑mers
+    deque: VecDeque<EncodedMmer>,
+    m: usize,
+    k: usize,
+    // We'll store the last few encoded bases to build new m‑mers quickly
+    // If you want to keep the entire read, you can do it. Or store just the last k bases.
+    buffer: [u8; 256], // if k <= 256, just a demonstration
+    buf_start: usize,
+    buf_len: usize,
 }
+
+impl RollingMinimizer {
+    pub fn new(k: usize, m: usize) -> Self {
+        RollingMinimizer {
+            deque: VecDeque::new(),
+            m,
+            k,
+            buffer: [0u8; 256],
+            buf_start: 0,
+            buf_len: 0,
+        }
+    }
+
+    /// Add one new base (encoded) at position i in the read,
+    /// remove old base if i >= k, etc. Then produce the current minimal m‑mer.
+    /// Return `Some(&EncodedMmer)` if we have a valid one, else `None`.
+    pub fn roll(&mut self, enc_base: u8, i: usize) -> Option<&EncodedMmer> {
+        // 1. push new base into `buffer`
+        // For demonstration, we do a ring buffer approach:
+        let idx = (self.buf_start + self.buf_len) % self.buffer.len();
+        self.buffer[idx] = enc_base;
+        if self.buf_len < self.k {
+            self.buf_len += 1;
+        } else {
+            // we've reached k, so i-k base is out of the window
+            self.buf_start = (self.buf_start + 1) % self.buffer.len();
+        }
+
+        // If we haven't filled up k yet, we don't produce a minimizer
+        // (the first k‑mer is fully available only when i+1 >= k)
+        if i + 1 < self.k {
+            return None;
+        }
+
+        let window_start = i + 1 - self.k; // index of the leftmost base in the k‑mer
+        // The rightmost base is at i
+        // So the new m‑mer (size m) would end at i => start is i - (m-1)
+
+        if i + 1 < self.m {
+            // can't form an m‑mer if i+1 < m
+            return None;
+        }
+
+        let mmer_start_in_read = i + 1 - self.m; // position in the read of the leftmost base of new m‑mer
+        // let's build the new m‑mer
+        let mut new_mmer = EncodedMmer {
+            pos: mmer_start_in_read,
+            data: [0u8; 31],
+        };
+
+        for offset in 0..self.m {
+            // read from the ring buffer
+            let ring_idx = (self.buf_start + (self.buf_len - self.k) + (self.k - self.m) + offset)
+                % self.buffer.len();
+            new_mmer.data[offset] = self.buffer[ring_idx];
+        }
+
+        // check if "bad"
+        if is_bad(&new_mmer.data[..self.m]) {
+            // skip pushing
+        } else {
+            // pop from the back while new is smaller
+            while let Some(back) = self.deque.back() {
+                if new_mmer.is_lex_smaller(back, self.m) {
+                    self.deque.pop_back();
+                } else {
+                    break;
+                }
+            }
+            self.deque.push_back(new_mmer);
+        }
+
+        // pop from front if out of range => if front.pos < window_start
+        while let Some(front) = self.deque.front() {
+            if front.pos < window_start {
+                self.deque.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // The front is the minimal valid m‑mer for this k‑mer
+        self.deque.front()
+    }
+}
+
 
 #[inline]
 fn compute_signature_slice<'a>(
@@ -126,50 +220,75 @@ fn compute_signature_slice<'a>(
     }
 }
 
-fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut results = Vec::new();
+fn read_to_superkmers(
+    read_seq: &[u8],
+    k: usize,
+    m: usize
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     if read_seq.len() < k {
-        return results;
+        return Vec::new();
     }
-
-    // 1) Encode the entire read forward, and build the reverse complement
     let encoded_fwd = encode_read(read_seq);
     let encoded_rev = reverse_complement_encoded(&encoded_fwd);
-    let read_len = read_seq.len();
 
-    // 2) Initialize the first k-mer's signature
-    let first_slice_fwd = &encoded_fwd[0..k];
-    let first_slice_rev = &encoded_rev[read_len - k..read_len];
-    let first_sig_slice = compute_signature_slice(first_slice_fwd, first_slice_rev, m);
-    let mut current_sig = first_sig_slice.to_vec();  // store as Vec<u8>
+    let mut roll_fwd = RollingMinimizer::new(k, m);
+    let mut roll_rev = RollingMinimizer::new(k, m);
+
+    // We'll track the current signature as a small Vec<u8>
+    let mut current_sig: Option<Vec<u8>> = None;
+    let mut results = Vec::new();
     let mut start_pos = 0;
 
-    // 3) Slide from i=1..=(read_len - k), computing signature for each k-mer
-    for i in 1..=(read_len - k) {
-        // forward sub-slice
-        let fwd_sub = &encoded_fwd[i..(i + k)];
-        // reverse sub-slice
-        let rev_sub = &encoded_rev[read_len - (i + k)..(read_len - i)];
+    for i in 0..encoded_fwd.len() {
+        let maybe_fwd = roll_fwd.roll(encoded_fwd[i], i);
+        let maybe_rev = roll_rev.roll(encoded_rev[i], i);
 
-        let next_sig_slice = compute_signature_slice(fwd_sub, rev_sub, m);
+        // If we haven't got a full k-mer yet => skip
+        if i + 1 < k {
+            continue;
+        }
 
-        // If the signature changes, we close out the old super-kmer
-        if next_sig_slice != &current_sig[..] {
-            // The old super-kmer covers [start_pos .. (i + k - 1)]
-            let block = read_seq[start_pos..(i + k - 1)].to_vec();
-            results.push((current_sig, block));
+        // pick whichever is lex smaller
+        let best: Option<&EncodedMmer> = match (maybe_fwd, maybe_rev) {
+            (None, None) => None,
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => {
+                if a.is_lex_smaller(b, m) { Some(a) } else { Some(b) }
+            }
+        };
 
-            current_sig = next_sig_slice.to_vec();
-            start_pos = i;
+        if let Some(front) = best {
+            let sig_slice = &front.data[..m];
+            match &current_sig {
+                Some(old) if old != sig_slice => {
+                    // signature changed => close out
+                    let block = read_seq[start_pos..i].to_vec(); 
+                    // actually, the super k-mer might end at i
+                    results.push((old.clone(), block));
+                    current_sig = Some(sig_slice.to_vec());
+                    start_pos = i; // new block starts at i
+                }
+                None => {
+                    current_sig = Some(sig_slice.to_vec());
+                    start_pos = i;
+                }
+                _ => { /* same signature => do nothing */ }
+            }
+        } else {
+            // no valid subwindow => fallback or do nothing
         }
     }
 
-    // 4) Final superkmer
-    let block = read_seq[start_pos..].to_vec();
-    results.push((current_sig, block));
+    // close out final super kmer if any
+    if let Some(sig) = current_sig {
+        let block = read_seq[start_pos..].to_vec();
+        results.push((sig, block));
+    }
 
     results
 }
+
 
 
 fn expand_superkmer_to_kmers(superkm_seq: &[u8], k: usize) -> impl Iterator<Item = &[u8]> {
@@ -574,6 +693,20 @@ pub struct KmerBin {
     buffer: Mutex<Vec<Vec<u8>>>,
     buffer_flush_size: usize,
 }
+
+#[derive(Clone)]
+struct EncodedMmer {
+    pos: usize,             // The starting position of this m‑mer in the read
+    data: [u8; 31],         // Only the first `m` bytes used if m <= 31
+}
+
+impl EncodedMmer {
+    // Compare lex order in the first `m` bytes
+    fn is_lex_smaller(&self, other: &EncodedMmer, m: usize) -> bool {
+        self.data[..m] < other.data[..m]
+    }
+}
+
 
 // kmers up to 31 bases long
 pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_quality: u8) {
