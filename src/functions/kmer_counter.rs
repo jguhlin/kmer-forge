@@ -246,12 +246,26 @@ impl KmerCounter {
                         });
                     } else {
                         counts.insert(kmer, 1);
-                    }
-                    
+                    }                    
                 }
             }});
 
-            
+
+        println!("Counts: {:?}", counts.len());
+        // Convert dashmap into a hashmap
+        let counts: HashMap<u64, u64> = counts.into_iter().map(|(k, v)| (k, v)).collect();
+
+        // Save to file
+        let mut out_fh = BufWriter::new(
+            File::create(format!("{}/counts.bin", temp_path)).expect("Could not create counts file"),
+        );
+
+        bincode::encode_into_std_write(
+            counts,
+            &mut out_fh,
+            bincode::config::standard().with_fixed_int_encoding(),
+        ).expect("Could not write to counts file");
+
 
 
     }
