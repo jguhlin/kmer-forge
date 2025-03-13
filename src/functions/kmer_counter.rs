@@ -169,7 +169,7 @@ impl KmerCounter {
         }
     }
 
-    pub fn merge_bins(mut self) {
+    pub fn merge_bins(self) {
         // Drain the bins, destruct, close the out_fh and open the file for reading instead
 
         let KmerCounter { 

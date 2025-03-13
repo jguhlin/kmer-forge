@@ -9,6 +9,7 @@ fn main() {
     count_kmers_file(&mut kmer_counter, filename, k, 20);
 
     kmer_counter.stop_gathering();
+    kmer_counter.merge_bins();
 
 
 
