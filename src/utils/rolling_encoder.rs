@@ -49,3 +49,42 @@ impl RollingKmer3 {
         self.code = ((self.code & self.mask) << bits_per_base) | nucleotide_to_3bit(new);
     }
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rolling_kmer() {
+        let k: usize = 21;
+        // Example sequence: must be at least k nucleotides.
+        let seq = b"AACGTNACGTNACGTNACGTN"; // exactly 21 nucleotides
+        let mut rk = RollingKmer3::new(seq, k).expect("Sequence too short");
+        println!("Initial encoding: {:#018x}", rk.code);
+
+        // Roll the k-mer: remove the leftmost nucleotide ('A') and append 'T'.
+        rk.roll(b'T');
+        println!("After rolling:   {:#018x}", rk.code);
+
+        // Roll the k-mer: remove the leftmost nucleotide ('C') and append 'G'.
+        rk.roll(b'G');
+
+        // Start a new one to confirm that the previous one was rolled correctly.
+        let mut rk2 = RollingKmer3::new(b"CGTNACGTNACGTNACGTNTG", k).expect("Sequence too short");
+        println!("Initial encoding: {:#018x}", rk2.code);
+
+        assert!(rk.code == rk2.code);
+
+        // Now for k=9
+        let k: usize = 9;
+        let seq = b"ACGTNACGT";
+        let mut rk = RollingKmer3::new(seq, k).expect("Sequence too short");
+        rk.roll(b'G');
+        rk.roll(b'C');
+
+        let mut rk2 = RollingKmer3::new(b"GTNACGTGC", k).expect("Sequence too short");
+        assert!(rk.code == rk2.code);
+    }
+}
