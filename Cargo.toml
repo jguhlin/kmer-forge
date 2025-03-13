@@ -11,11 +11,13 @@ bytecount = { version = "0.6.8", features = ["runtime-dispatch-simd"] }
 # clap = { version = "4.5.31", features = ["derive"] }
 # criterion = "0.5.1"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+dashmap = "6.1.0"
 indicatif = "0.17.11"
 lz4_flex = { version = "0.11.3", default-features = false }
 # growable-bloom-filter = "2.1.1"
 needletail = "0.6.3"
 pulp = "0.21.4"
+rayon = "1.10.0"
 # rayon = "1.10.0"
 # xorf = "0.11.0"
 xxhash-rust = { version = "0.8.15", features = ["std", "xxh3", "const_xxh3"] }

@@ -1,8 +1,8 @@
-mod utils;
 mod functions;
+mod utils;
 
-pub use utils::*;
 pub use functions::*;
+pub use utils::*;
 
 #[cfg(test)]
 mod tests {

@@ -6,11 +6,9 @@ fn main() {
 
     let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 512 * 1024, 8);
 
+    // todo: should be able to read files in parallel
     count_kmers_file(&mut kmer_counter, filename, k, 20);
 
     kmer_counter.stop_gathering();
     kmer_counter.merge_bins();
-
-
-
 }

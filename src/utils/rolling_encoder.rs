@@ -50,8 +50,6 @@ impl RollingKmer3 {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

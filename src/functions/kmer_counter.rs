@@ -1,15 +1,17 @@
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
+use dashmap::DashMap;
 use needletail::{Sequence, parse_fastx_reader};
 use pulp::Arch;
 use xxhash_rust::xxh3::xxh3_64;
+use rayon::prelude::*;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::rolling_encoder::RollingKmer3;
 
@@ -68,7 +70,8 @@ impl KmerCounter {
                 temp_path.to_str().unwrap(),
                 i
             );
-            let out_fh = BufWriter::new(File::create(bin_path.clone()).expect("Could not create bin file"));
+            let out_fh =
+                BufWriter::new(File::create(bin_path.clone()).expect("Could not create bin file"));
             let out_fh = Mutex::new(out_fh);
             bins.push(KmerBin {
                 number: i as u16,
@@ -83,8 +86,12 @@ impl KmerCounter {
 
         // Create the channels
         let (kmer_tx, kmer_rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(64);
-        let (compression_tx, compression_rx): (Sender<(usize, Vec<u64>)>, Receiver<(usize, Vec<u64>)>) = bounded(64);
-        let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = unbounded();
+        let (compression_tx, compression_rx): (
+            Sender<(usize, Vec<u64>)>,
+            Receiver<(usize, Vec<u64>)>,
+        ) = bounded(64);
+        let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) =
+            unbounded();
 
         // Create the workers
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -98,7 +105,16 @@ impl KmerCounter {
             let shutdown_flag = shutdown_flag.clone();
             let bins = bins.clone();
             let worker = thread::spawn(move || {
-                kmer_worker(kmer_rx, compression_rx, compression_tx, output_rx, output_tx, shutdown_flag, bins, bin_power);
+                kmer_worker(
+                    kmer_rx,
+                    compression_rx,
+                    compression_tx,
+                    output_rx,
+                    output_tx,
+                    shutdown_flag,
+                    bins,
+                    bin_power,
+                );
             });
             workers.push(worker);
         }
@@ -126,7 +142,10 @@ impl KmerCounter {
             .expect("Could not send kmers to worker");
     }
 
-    pub fn try_submit(&self, kmers: Vec<u64>) -> Result<(), crossbeam::channel::TrySendError<Vec<u64>>> {
+    pub fn try_submit(
+        &self,
+        kmers: Vec<u64>,
+    ) -> Result<(), crossbeam::channel::TrySendError<Vec<u64>>> {
         self.kmer_tx.try_send(kmers)
     }
 
@@ -146,7 +165,9 @@ impl KmerCounter {
         for bin in self.bins.iter() {
             let mut bin_lock = bin.buffer.lock().unwrap();
             if !bin_lock.is_empty() {
-                self.compression_tx.send((bin.number as usize, bin_lock.clone())).expect("Could not send buffer to compressor");
+                self.compression_tx
+                    .send((bin.number as usize, bin_lock.clone()))
+                    .expect("Could not send buffer to compressor");
             }
             bin_lock.clear();
             bin_lock.shrink_to_fit();
@@ -172,65 +193,67 @@ impl KmerCounter {
     pub fn merge_bins(self) {
         // Drain the bins, destruct, close the out_fh and open the file for reading instead
 
-        let KmerCounter { 
+        let KmerCounter {
             temp_path,
             bins,
             threads,
             ..
-         } = self;
+        } = self;
 
-         let mut bins = Arc::into_inner(bins).expect("Could not get bins");
+        let mut bins = Arc::into_inner(bins).expect("Could not get bins");
 
-        for bin in bins.drain(..).into_iter() {
-            let KmerBin { 
-                number,
-                filename,
-                ..
-            } = bin;
+        let mut counts: DashMap<u64, u64> = DashMap::new();
 
-            println!("Opening bin {}", number);
+        let bins = bins.drain(..).into_iter().map(|x| (x.number, x.filename)).collect::<Vec<_>>();
+
+        // Using rayon, merge the bins
+        bins.into_par_iter().for_each(|(number, filename)| {
             let bin = File::open(filename).expect("Could not open bin file");
             let mut reader = BufReader::new(bin);
 
-            let mut counts = HashMap::new();
             let bincode_config = bincode::config::standard().with_fixed_int_encoding();
 
-            let mut decompressor = zstd::bulk::Decompressor::new().expect("Could not create decompressor");
+            let mut decompressor =
+                zstd::bulk::Decompressor::new().expect("Could not create decompressor");
 
             loop {
-                let kmers: Vec<u8> = match bincode::decode_from_std_read(&mut reader, bincode_config) {
-                    Ok(kmers) => kmers,
-                    Err(_e) => // EOF most likely
-                    {
-                        break;
-                    }
-                };
+                let kmers: Vec<u8> =
+                    match bincode::decode_from_std_read(&mut reader, bincode_config) {
+                        Ok(kmers) => kmers,
+                        Err(_e) =>
+                        // EOF most likely
+                        {
+                            break;
+                        }
+                    };
 
                 if kmers.is_empty() {
                     break;
                 }
 
                 // Capacity set to 8Gb, should never be that high, ofc....
-                let kmers = decompressor.decompress(&kmers, 8 * 1024 * 1024 * 1024).expect("Could not decompress buffer");
-                let kmers: Vec<u64> = bincode::decode_from_slice(&kmers, bincode_config).expect("Could not decode buffer").0;
+                let kmers = decompressor
+                    .decompress(&kmers, 8 * 1024 * 1024 * 1024)
+                    .expect("Could not decompress buffer");
+                let kmers: Vec<u64> = bincode::decode_from_slice(&kmers, bincode_config)
+                    .expect("Could not decode buffer")
+                    .0;
 
                 for kmer in kmers {
-                    counts.get_mut(&kmer).map(|count| *count += 1).unwrap_or_else(|| { counts.insert(kmer, 1); });
-                }                
-            }
+                    if counts.contains_key(&kmer) {
+                        counts.alter(&kmer, |_, count| {
+                            count + 1
+                        });
+                    } else {
+                        counts.insert(kmer, 1);
+                    }
+                    
+                }
+            }});
 
-            // Debugging
-            println!("Bin {} has {} kmers", number, counts.len());
-
-            // Save the counts to a file
-            let out_fh = File::create(format!("{}/bin{}.counts", temp_path, number)).expect("Could not create count file");
-            let mut out_fh = BufWriter::new(out_fh);
-            bincode::encode_into_std_write(&counts, &mut out_fh, bincode_config).expect("Could not write to count file");
-
-            counts.clear();
-        }
             
-        
+
+
     }
 }
 
@@ -244,7 +267,6 @@ fn kmer_worker(
     bins: Arc<Vec<KmerBin>>,
     bin_power: u8,
 ) {
-
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 16384;
 
@@ -252,7 +274,7 @@ fn kmer_worker(
 
     // did not seem to help
     // compressor.set_parameter(zstd::stream::raw::CParameter::Strategy(zstd::zstd_safe::zstd_sys::ZSTD_strategy::ZSTD_fast)).expect("Could not set compression level");
-    
+
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
     let mut local_buffers: Vec<Vec<u64>> = (0..bin_count)
@@ -281,10 +303,16 @@ fn kmer_worker(
             while let Ok((bin, mut kmers)) = compression_rx.try_recv() {
                 kmers.sort_unstable();
 
-                let encoded = bincode::encode_to_vec(&kmers, bincode::config::standard().with_fixed_int_encoding()).expect("Could not write to bin file");
+                let encoded = bincode::encode_to_vec(
+                    &kmers,
+                    bincode::config::standard().with_fixed_int_encoding(),
+                )
+                .expect("Could not write to bin file");
 
                 // zstd
-                let compressed = compressor.compress(&encoded).expect("Could not compress buffer");
+                let compressed = compressor
+                    .compress(&encoded)
+                    .expect("Could not compress buffer");
 
                 // lz4_flex
                 // let compressed = compress(&encoded);
@@ -293,7 +321,9 @@ fn kmer_worker(
                 // No real speed difference...
                 // let compressed = encoded;
 
-                output_tx.send((bin, compressed)).expect("Could not send compressed buffer to flusher");
+                output_tx
+                    .send((bin, compressed))
+                    .expect("Could not send compressed buffer to flusher");
             }
         }
 
@@ -327,13 +357,15 @@ fn kmer_worker(
             }
         }
 
-        if !bins_to_submit.is_empty() && compression_rx.len() as f32 <= 0.8 * compression_rx.capacity().unwrap() as f32 {
+        if !bins_to_submit.is_empty()
+            && compression_rx.len() as f32 <= 0.8 * compression_rx.capacity().unwrap() as f32
+        {
             for bin in bins_to_submit.drain(..) {
                 let mut bin_lock = match bins[bin].buffer.try_lock() {
                     Ok(lock) => lock,
                     Err(_) => continue, // Assume another thread is flushing this buffer
                 };
-                
+
                 // Confirm that another thread didn't flush it
                 if bin_lock.len() < bins[bin].buffer_flush_size {
                     continue;
@@ -343,7 +375,9 @@ fn kmer_worker(
                 std::mem::swap(&mut *bin_lock, &mut bin_buffer);
                 drop(bin_lock);
 
-                compression_tx.send((bin, bin_buffer)).expect("Could not send buffer to compressor");
+                compression_tx
+                    .send((bin, bin_buffer))
+                    .expect("Could not send buffer to compressor");
             }
         }
 
@@ -451,12 +485,11 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
                 }
                 Err(crossbeam::channel::TrySendError::Full(kmers)) => {
                     kmers_to_submit = kmers;
-                }, // Process more reads then...
+                } // Process more reads then...
                 Err(crossbeam::channel::TrySendError::Disconnected(_kmers)) => {
                     panic!("Kmer counter disconnected before shutdown");
                 }
             }
-            
         }
     }
 }
