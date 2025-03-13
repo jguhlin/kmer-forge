@@ -15,6 +15,157 @@ use std::thread::{self, JoinHandle};
 
 use crate::rolling_encoder::RollingKmer3;
 
+static DNA_CODES: [u8; 256] = {
+    const X: u8 = 4;
+    let mut table = [X; 256];
+    table[b'A' as usize] = 0; table[b'a' as usize] = 0;
+    table[b'C' as usize] = 1; table[b'c' as usize] = 1;
+    table[b'G' as usize] = 2; table[b'g' as usize] = 2;
+    table[b'T' as usize] = 3; table[b't' as usize] = 3;
+    // everything else stays 4
+    table
+};
+
+#[inline(always)]
+fn encode_base(base: u8) -> u8 {
+    DNA_CODES[base as usize]
+}
+
+#[inline(always)]
+fn is_bad(mmer: &[u8]) -> bool {
+    // skip if any base == 4 ('N')
+    if mmer.contains(&4) {
+        return true;
+    }
+    if mmer.len() >= 3 {
+        // skip if prefix is AAA(0,0,0) or ACA(0,1,0)
+        if &mmer[..3] == [0,0,0] || &mmer[..3] == [0,1,0] {
+            return true;
+        }
+    }
+    // skip if interior 'AA' -> [0,0] except at index 0
+    // i.e. search for [0,0] starting at i>=1
+    for i in 1..mmer.len() {
+        if i < mmer.len() && mmer[i-1] == 0 && mmer[i] == 0 {
+            // found [0,0] at index i-1..i
+            // skip if i-1 > 0, i.e. i>1
+            if i-1 > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn canonical_mmer<'a>(fwd: &'a [u8], rev: &'a [u8]) -> &'a [u8] {
+    if rev < fwd { rev } else { fwd }
+}
+
+fn compute_signature(kmer: &[u8], m: usize) -> u64 {
+    let k_len = kmer.len();
+    if k_len < m {
+        // fallback: hash entire
+        return xxh3_64(kmer);
+    }
+
+    // 1) encode entire k-mer
+    // For big k, do it with pulp in chunks:
+    let arch = Arch::new();
+    let mut encoded = vec![0u8; k_len];
+    arch.dispatch(|| {
+        for (i, &b) in kmer.iter().enumerate() {
+            encoded[i] = encode_base(b);
+        }
+    });
+
+    // 2) build reverse complement once
+    let mut encoded_rc = vec![0u8; k_len];
+    arch.dispatch(|| {
+        let end = k_len - 1;
+        for i in 0..k_len {
+            let c = encoded[i];
+            // complement
+            let c_rc = match c {
+                0 => 3,
+                1 => 2,
+                2 => 1,
+                3 => 0,
+                _ => 4, // N->N
+            };
+            encoded_rc[end - i] = c_rc;
+        }
+    });
+
+    // 3) find lexicographically smallest “good” m-mer
+    let mut best: Option<&[u8]> = None;
+
+    for start in 0..=(k_len - m) {
+        let fwd = &encoded[start..(start + m)];
+        // corresponding rc slice
+        //   forward window is start..start+m
+        //   in rc => (k_len - (start+m))..(k_len - start)
+        let rc_start = k_len - (start + m);
+        let rev = &encoded_rc[rc_start..(rc_start + m)];
+
+        let cand = canonical_mmer(fwd, rev);
+        if is_bad(cand) {
+            continue;
+        }
+
+        match best {
+            Some(current) => {
+                if cand < current {
+                    best = Some(cand);
+                }
+            }
+            None => {
+                best = Some(cand);
+            }
+        }
+    }
+
+    // 4) hash it if found, otherwise fallback
+    if let Some(b) = best {
+        xxh3_64(b)
+    } else {
+        xxh3_64(kmer)
+    }
+}
+
+fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(u64, Vec<u8>)> {
+    let mut result = Vec::new();
+    if read_seq.len() < k {
+        return result;
+    }
+
+    let first_sig = compute_signature(&read_seq[0..k], m);
+    let mut current_sig = first_sig;
+    let mut start_pos = 0;
+
+    for i in 1..=(read_seq.len() - k) {
+        let next_sig = compute_signature(&read_seq[i..i + k], m);
+        if next_sig != current_sig {
+            // close out
+            let block = read_seq[start_pos..(i + k - 1)].to_vec();
+            result.push((current_sig, block));
+
+            // start new
+            current_sig = next_sig;
+            start_pos = i;
+        }
+    }
+    // final
+    let block = read_seq[start_pos..].to_vec();
+    result.push((current_sig, block));
+    result
+}
+
+fn expand_superkmer_to_kmers(superkm_seq: &[u8], k: usize) -> impl Iterator<Item = &[u8]> {
+    // yields each k-mer slice
+    superkm_seq.windows(k)
+}
+
 pub struct KmerCounter {
     k: u8,
     temp_path: String,
@@ -22,10 +173,10 @@ pub struct KmerCounter {
     bin_count: u16,
     threads: usize,
     workers: Vec<JoinHandle<()>>,
-    kmer_tx: Sender<Vec<u64>>,
-    kmer_rx: Receiver<Vec<u64>>,
-    compression_tx: Sender<(usize, Vec<u64>)>,
-    compression_rx: Receiver<(usize, Vec<u64>)>,
+    kmer_tx: Sender<Vec<(u64, Vec<u8>)>>,
+    kmer_rx: Receiver<Vec<(u64, Vec<u8>)>>,
+    compression_tx: Sender<(usize, Vec<Vec<u8>>)>,
+    compression_rx: Receiver<(usize, Vec<Vec<u8>>)>,
     output_tx: Sender<(usize, Vec<u8>)>,
     output_rx: Receiver<(usize, Vec<u8>)>,
     shutdown_flag: Arc<AtomicBool>,
@@ -85,13 +236,9 @@ impl KmerCounter {
         let bins = Arc::new(bins);
 
         // Create the channels
-        let (kmer_tx, kmer_rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(64);
-        let (compression_tx, compression_rx): (
-            Sender<(usize, Vec<u64>)>,
-            Receiver<(usize, Vec<u64>)>,
-        ) = bounded(64);
-        let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) =
-            unbounded();
+        let (kmer_tx, kmer_rx)= bounded(64);
+        let (compression_tx, compression_rx) = bounded(64);
+        let (output_tx, output_rx) = unbounded();
 
         // Create the workers
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -136,7 +283,7 @@ impl KmerCounter {
         }
     }
 
-    pub fn submit(&self, kmers: Vec<u64>) {
+    pub fn submit(&self, kmers: Vec<(u64, Vec<u8>)>) {
         self.kmer_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
@@ -144,8 +291,8 @@ impl KmerCounter {
 
     pub fn try_submit(
         &self,
-        kmers: Vec<u64>,
-    ) -> Result<(), crossbeam::channel::TrySendError<Vec<u64>>> {
+        kmers: Vec<(u64, Vec<u8>)>,
+    ) -> Result<(), crossbeam::channel::TrySendError<Vec<(u64, Vec<u8>)>>> {
         self.kmer_tx.try_send(kmers)
     }
 
@@ -272,9 +419,9 @@ impl KmerCounter {
 }
 
 fn kmer_worker(
-    kmer_rx: crossbeam::channel::Receiver<Vec<u64>>,
-    compression_rx: crossbeam::channel::Receiver<(usize, Vec<u64>)>,
-    compression_tx: crossbeam::channel::Sender<(usize, Vec<u64>)>,
+    kmer_rx: crossbeam::channel::Receiver<Vec<(u64, Vec<u8>)>>,
+    compression_rx: crossbeam::channel::Receiver<(usize, Vec<Vec<u8>>)>,
+    compression_tx: crossbeam::channel::Sender<(usize, Vec<Vec<u8>>)>,
     output_rx: crossbeam::channel::Receiver<(usize, Vec<u8>)>,
     output_tx: crossbeam::channel::Sender<(usize, Vec<u8>)>,
     shutdown_flag: Arc<AtomicBool>,
@@ -291,7 +438,7 @@ fn kmer_worker(
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
-    let mut local_buffers: Vec<Vec<u64>> = (0..bin_count)
+    let mut local_buffers: Vec<Vec<Vec<u8>>> = (0..bin_count)
         .map(|_| Vec::with_capacity(FLUSH_THRESHOLD))
         .collect();
 
@@ -348,12 +495,11 @@ fn kmer_worker(
         };
 
         // For each kmer, calculate the bin and store it in the corresponding local buffer.
-        for kmer in kmers {
-            let hash = xxh3_64(&kmer.to_ne_bytes());
+        for (hash, superkmer) in kmers {
             let bin = hash & bin_mask;
             let bin_index = bin as usize;
 
-            local_buffers[bin_index].push(kmer);
+            local_buffers[bin_index].push(superkmer);
 
             // If the thread-local buffer has reached the threshold, flush it.
             if local_buffers[bin_index].len() >= FLUSH_THRESHOLD {
@@ -414,7 +560,7 @@ pub struct KmerBin {
     number: u16,
     out_fh: Mutex<BufWriter<std::fs::File>>,
     filename: String,
-    buffer: Mutex<Vec<u64>>,
+    buffer: Mutex<Vec<Vec<u8>>>,
     buffer_flush_size: usize,
 }
 
@@ -467,30 +613,7 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         let seq = seq.strip_returns();
         let seq = seq.normalize(true);
 
-        let rc = seq.reverse_complement();
-
-        let mut kmers = seq.kmers(k);
-        let mut rolling_encoder =
-            RollingKmer3::new(&kmers.next().unwrap(), k as usize).expect("Sequence too short");
-        // Add the first code to the vec
-        kmers_to_submit.push(rolling_encoder.code);
-
-        // Roll the rest
-        for kmer in kmers {
-            rolling_encoder.roll(kmer[k as usize - 1]);
-            kmers_to_submit.push(rolling_encoder.code);
-        }
-
-        let mut rc_kmers = rc.kmers(k);
-        let mut rolling_encoder =
-            RollingKmer3::new(&rc_kmers.next().unwrap(), k as usize).expect("Sequence too short");
-        // Add the first code to the vec
-        kmers_to_submit.push(rolling_encoder.code);
-        // Roll the rest
-        for kmer in rc_kmers {
-            rolling_encoder.roll(kmer[k as usize - 1]);
-            kmers_to_submit.push(rolling_encoder.code);
-        }
+        kmers_to_submit.extend(read_to_superkmers(&seq, k as usize, 8).drain(..));
 
         if kmers_to_submit.len() >= 8 * 1024 {
             match kmer_counter.try_submit(kmers_to_submit) {
