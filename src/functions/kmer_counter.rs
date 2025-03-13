@@ -31,6 +31,38 @@ fn encode_base(base: u8) -> u8 {
     DNA_CODES[base as usize]
 }
 
+fn encode_read(seq: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![0u8; seq.len()];
+    let arch = pulp::Arch::new();
+    arch.dispatch(|| {
+        for (i, &b) in seq.iter().enumerate() {
+            encoded[i] = encode_base(b); // using your DNA_CODES table
+        }
+    });
+    encoded
+}
+
+fn reverse_complement_encoded(encoded: &[u8]) -> Vec<u8> {
+    let mut rc = vec![0u8; encoded.len()];
+    let arch = pulp::Arch::new();
+    arch.dispatch(|| {
+        let end = encoded.len() - 1;
+        for i in 0..encoded.len() {
+            let c = encoded[i];
+            let c_rc = match c {
+                0 => 3, // A->T
+                1 => 2, // C->G
+                2 => 1, // G->C
+                3 => 0, // T->A
+                _ => 4, // N->N
+            };
+            rc[end - i] = c_rc;
+        }
+    });
+    rc
+}
+
+/// Checks if this m-mer is considered low-complexity or invalid.
 #[inline(always)]
 fn is_bad(mmer: &[u8]) -> bool {
     // skip if any base == 4 ('N')
@@ -43,13 +75,11 @@ fn is_bad(mmer: &[u8]) -> bool {
             return true;
         }
     }
-    // skip if interior 'AA' -> [0,0] except at index 0
-    // i.e. search for [0,0] starting at i>=1
+    // skip if interior 'AA' -> [0,0] except at index=0
     for i in 1..mmer.len() {
-        if i < mmer.len() && mmer[i-1] == 0 && mmer[i] == 0 {
-            // found [0,0] at index i-1..i
-            // skip if i-1 > 0, i.e. i>1
-            if i-1 > 0 {
+        if i < mmer.len() && mmer[i - 1] == 0 && mmer[i] == 0 {
+            // found [A,A]
+            if i - 1 > 0 {
                 return true;
             }
         }
@@ -62,95 +92,85 @@ fn canonical_mmer<'a>(fwd: &'a [u8], rev: &'a [u8]) -> &'a [u8] {
     if rev < fwd { rev } else { fwd }
 }
 
-fn compute_signature(kmer: &[u8], m: usize) -> Vec<u8> {
-    let k_len = kmer.len();
-
-    // 1) encode entire k-mer
-    // For big k, do it with pulp in chunks:
-    let arch = Arch::new();
-    let mut encoded = vec![0u8; k_len];
-    arch.dispatch(|| {
-        for (i, &b) in kmer.iter().enumerate() {
-            encoded[i] = encode_base(b);
-        }
-    });
-
-    // 2) build reverse complement once
-    let mut encoded_rc = vec![0u8; k_len];
-    arch.dispatch(|| {
-        let end = k_len - 1;
-        for i in 0..k_len {
-            let c = encoded[i];
-            // complement
-            let c_rc = match c {
-                0 => 3,
-                1 => 2,
-                2 => 1,
-                3 => 0,
-                _ => 4, // N->N
-            };
-            encoded_rc[end - i] = c_rc;
-        }
-    });
-
-    // 3) find lexicographically smallest “good” m-mer
+#[inline]
+fn compute_signature_slice<'a>(
+    encoded_fwd: &'a [u8],   // a slice of length k in the forward-encoded read
+    encoded_rev: &'a [u8],   // the matching slice of length k in the reverse-encoded read
+    m: usize
+) -> &'a [u8] {
     let mut best: Option<&[u8]> = None;
+    let k_len = encoded_fwd.len(); // should be k
 
     for start in 0..=(k_len - m) {
-        let fwd = &encoded[start..(start + m)];
-        // corresponding rc slice
-        //   forward window is start..start+m
-        //   in rc => (k_len - (start+m))..(k_len - start)
-        let rc_start = k_len - (start + m);
-        let rev = &encoded_rc[rc_start..(rc_start + m)];
-
-        let cand = canonical_mmer(fwd, rev);
+        let fwd_sub = &encoded_fwd[start..start+m];
+        let rev_sub = &encoded_rev[k_len - m - start..(k_len - start)];
+        // pick canonical
+        let cand = if rev_sub < fwd_sub { rev_sub } else { fwd_sub };
         if is_bad(cand) {
             continue;
         }
-
         match best {
             Some(current) => {
                 if cand < current {
                     best = Some(cand);
                 }
             }
-            None => {
-                best = Some(cand);
-            }
+            None => best = Some(cand),
         }
     }
 
-    best.unwrap_or(kmer).to_vec()
+    // fallback if no valid sub
+    match best {
+        Some(x) => x,
+        None => encoded_fwd, // or empty
+    }
 }
 
 fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut result = Vec::new();
+    let mut results = Vec::new();
     if read_seq.len() < k {
-        return result;
+        return results;
     }
 
-    let first_sig = compute_signature(&read_seq[0..k], m);
-    let mut current_sig = first_sig;
+    // 1) Encode the entire read forward, and build the reverse complement
+    let encoded_fwd = encode_read(read_seq);
+    let encoded_rev = reverse_complement_encoded(&encoded_fwd);
+    let read_len = read_seq.len();
+
+    // 2) Initialize the first k-mer's signature
+    let first_slice_fwd = &encoded_fwd[0..k];
+    let first_slice_rev = &encoded_rev[read_len - k..read_len];
+    let first_sig_slice = compute_signature_slice(first_slice_fwd, first_slice_rev, m);
+    let mut current_sig = first_sig_slice.to_vec();  // store as Vec<u8>
     let mut start_pos = 0;
 
-    for i in 1..=(read_seq.len() - k) {
-        let next_sig = compute_signature(&read_seq[i..i + k], m);
-        if next_sig != current_sig {
-            // close out
-            let block = read_seq[start_pos..(i + k - 1)].to_vec();
-            result.push((current_sig, block));
+    // 3) Slide from i=1..=(read_len - k), computing signature for each k-mer
+    for i in 1..=(read_len - k) {
+        // forward sub-slice
+        let fwd_sub = &encoded_fwd[i..(i + k)];
+        // reverse sub-slice
+        let rev_sub = &encoded_rev[read_len - (i + k)..(read_len - i)];
 
-            // start new
-            current_sig = next_sig;
+        let next_sig_slice = compute_signature_slice(fwd_sub, rev_sub, m);
+
+        // If the signature changes, we close out the old super-kmer
+        if next_sig_slice != &current_sig[..] {
+            // The old super-kmer covers [start_pos .. (i + k - 1)]
+            let block = read_seq[start_pos..(i + k - 1)].to_vec();
+            results.push((current_sig, block));
+
+            current_sig = next_sig_slice.to_vec();
             start_pos = i;
         }
     }
-    // final
+
+    // 4) Final superkmer
     let block = read_seq[start_pos..].to_vec();
-    result.push((current_sig, block));
-    result
+    results.push((current_sig, block));
+
+    results
 }
+
 
 fn expand_superkmer_to_kmers(superkm_seq: &[u8], k: usize) -> impl Iterator<Item = &[u8]> {
     // yields each k-mer slice
@@ -487,7 +507,8 @@ fn kmer_worker(
 
         // For each kmer, calculate the bin and store it in the corresponding local buffer.
         for (minimzer, superkmer) in kmers {
-            let bin_index = minimzer[0] as usize & bin_mask;
+            let bin_hash = xxh3_64(&minimzer);
+            let bin_index = (bin_hash as usize) & bin_mask;
 
             local_buffers[bin_index].push(superkmer);
 
