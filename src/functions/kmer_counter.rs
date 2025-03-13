@@ -121,7 +121,7 @@ fn compute_signature(kmer: &[u8], m: usize) -> Vec<u8> {
         }
     }
 
-    best.unwrap().to_vec()
+    best.unwrap_or(kmer).to_vec()
 }
 
 fn read_to_superkmers(read_seq: &[u8], k: usize, m: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
