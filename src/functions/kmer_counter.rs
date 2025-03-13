@@ -202,7 +202,7 @@ impl KmerCounter {
 
         let mut bins = Arc::into_inner(bins).expect("Could not get bins");
 
-        let mut counts: DashMap<u64, u64> = DashMap::new();
+        let mut counts: DashMap<u64, u32> = DashMap::new();
 
         let bins = bins.drain(..).into_iter().map(|x| (x.number, x.filename)).collect::<Vec<_>>();
 
@@ -242,7 +242,7 @@ impl KmerCounter {
                 for kmer in kmers {
                     if counts.contains_key(&kmer) {
                         counts.alter(&kmer, |_, count| {
-                            count + 1
+                            count.saturating_add(1)
                         });
                     } else {
                         counts.insert(kmer, 1);
@@ -253,7 +253,7 @@ impl KmerCounter {
 
         println!("Counts: {:?}", counts.len());
         // Convert dashmap into a hashmap
-        let counts: HashMap<u64, u64> = counts.into_iter().map(|(k, v)| (k, v)).collect();
+        let counts: HashMap<u64, u32> = counts.into_iter().map(|(k, v)| (k, v)).collect();
 
         // Save to file
         let mut out_fh = BufWriter::new(
