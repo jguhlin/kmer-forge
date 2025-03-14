@@ -4,6 +4,7 @@ use needletail::{Sequence, parse_fastx_reader};
 use pulp::Arch;
 use xxhash_rust::xxh3::xxh3_64;
 use rayon::prelude::*;
+use nthash::NtHashIterator;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -427,7 +428,7 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
     // debugging
     let mut processed_reads = 0;
 
-    let mut kmers_to_submit = Vec::with_capacity(8 * 1024);
+    // let mut kmers_to_submit = Vec::with_capacity(8 * 1024);
 
     while let Some(record) = reader.next() {
         processed_reads += 1;
@@ -466,44 +467,46 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
 
         let seq = seq.strip_returns();
         let seq = seq.normalize(true);
-
         let rc = seq.reverse_complement();
+        let mut kmers = seq.canonical_kmers(k, &rc);
 
-        let mut kmers = seq.kmers(k);
-        let mut rolling_encoder =
-            RollingKmer3::new(&kmers.next().unwrap(), k as usize).expect("Sequence too short");
-        // Add the first code to the vec
-        kmers_to_submit.push(rolling_encoder.code);
+        let mut superkmers = Vec::new();
 
-        // Roll the rest
-        for kmer in kmers {
-            rolling_encoder.roll(kmer[k as usize - 1]);
-            kmers_to_submit.push(rolling_encoder.code);
-        }
+        let mut superkmers_count = 0;
+        let mut total_kmers = 0;
 
-        let mut rc_kmers = rc.kmers(k);
-        let mut rolling_encoder =
-            RollingKmer3::new(&rc_kmers.next().unwrap(), k as usize).expect("Sequence too short");
-        // Add the first code to the vec
-        kmers_to_submit.push(rolling_encoder.code);
-        // Roll the rest
-        for kmer in rc_kmers {
-            rolling_encoder.roll(kmer[k as usize - 1]);
-            kmers_to_submit.push(rolling_encoder.code);
-        }
+        let mut kmer_min = NtHashIterator::new(&kmers.next().unwrap().1, 7).expect("Could not create NtHashIterator").min().expect("Could not get min");
+        let mut superkmer_start_kmer_start = 0;
 
-        if kmers_to_submit.len() >= 8 * 1024 {
-            match kmer_counter.try_submit(kmers_to_submit) {
-                Ok(_) => {
-                    kmers_to_submit = Vec::with_capacity(8 * 1024);
-                }
-                Err(crossbeam::channel::TrySendError::Full(kmers)) => {
-                    kmers_to_submit = kmers;
-                } // Process more reads then...
-                Err(crossbeam::channel::TrySendError::Disconnected(_kmers)) => {
-                    panic!("Kmer counter disconnected before shutdown");
-                }
+        for (i, kmer, rc) in kmers {
+            total_kmers += 1;
+            let iter = NtHashIterator::new(&kmer, 7).expect("Could not create NtHashIterator");
+            let min = iter.min().expect("Could not get min");
+            
+            if min != kmer_min {
+                // superkmers.push((superkmer_start_pos, pos, kmer_min, rc));
+
+                // Get the actual sequence / superkmer
+                let superkmer = &seq[superkmer_start_kmer_start..i+k as usize];
+                superkmers.push(superkmer);
+                
+                // Insert and all that
+                kmer_min = min;
+                superkmer_start_kmer_start = i;
+                superkmers_count += 1;
             }
         }
+
+        // Last one
+        let superkmer = &seq[superkmer_start_kmer_start..];
+        superkmers.push(superkmer);
+      
+        println!("Superkmers: {}", superkmers_count);
+        println!("Total kmers: {}", total_kmers);
+        println!("Superkmers raw: {:?}", superkmers);
+
+        // Only process one for DEBUGGING
+        return;
+
     }
 }
