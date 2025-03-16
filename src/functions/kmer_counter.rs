@@ -476,8 +476,19 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         superkmers.push((kmer_min, superkmer.to_vec()));
 
         if superkmers.len() > 64 * 1024 {
-            kmer_counter.submit(superkmers);
-            superkmers = Vec::with_capacity(64 * 1024);
+            match kmer_counter.try_submit(superkmers) {
+                Ok(()) => {
+                    superkmers = Vec::with_capacity(64 * 1024);
+                }
+                Err(crossbeam::channel::TrySendError::Full(kmers)) => {
+                    println!("Kmer Channel Full");
+                    superkmers = kmers;
+                }
+                Err(crossbeam::channel::TrySendError::Disconnected(kmers)) => {
+                    superkmers = kmers;
+                    break;
+                }
+            }
         }
     }
 
