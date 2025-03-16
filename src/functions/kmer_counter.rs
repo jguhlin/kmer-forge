@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use crate::SuperKmerStorage;
+
 const LOCAL_FLUSH_THRESHOLD: usize = 16384;
 const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
 
@@ -83,7 +85,7 @@ impl KmerCounter {
                 number: i as u16,
                 filename: bin_path,
                 out_fh,
-                buffer: Mutex::new(Vec::with_capacity(GLOBAL_FLUSH_THRESHOLD)),
+                buffer: Mutex::new(SuperKmerStorage::new()),
             });
         }
 
@@ -392,7 +394,7 @@ pub struct KmerBin {
     number: u16,
     out_fh: Mutex<BufWriter<std::fs::File>>,
     filename: String,
-    buffer: Mutex<Vec<Vec<u8>>>,
+    buffer: Mutex<SuperKmerStorage>,
 }
 
 // kmers up to 31 bases long
