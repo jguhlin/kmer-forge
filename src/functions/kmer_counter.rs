@@ -282,7 +282,7 @@ fn kmer_worker(
     let bin_mask = (1 << bin_power) - 1;
     const FLUSH_THRESHOLD: usize = 16384;
 
-    let mut compressor = zstd::bulk::Compressor::new(-1).expect("Could not create compressor");
+        let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
 
     // did not seem to help
     // compressor.set_parameter(zstd::stream::raw::CParameter::Strategy(zstd::zstd_safe::zstd_sys::ZSTD_strategy::ZSTD_fast)).expect("Could not set compression level");
@@ -419,8 +419,11 @@ pub struct KmerBin {
 // kmers up to 31 bases long
 pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_quality: u8) {
     let file = File::open(file).expect("Could not open file");
-    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let reader = BufReader::new(file);
     let mut reader = parse_fastx_reader(reader).expect("Invalid file");
+
+    let mut superkmers = Vec::new();
+
 
     // debugging
     let mut processed_reads = 0;
@@ -467,8 +470,6 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         let rc = seq.reverse_complement();
         let mut kmers = seq.canonical_kmers(k, &rc);
 
-        let mut superkmers = Vec::new();
-
         let mut superkmers_count = 0;
         let mut total_kmers = 0;
 
@@ -498,8 +499,11 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         let superkmer = &seq[superkmer_start_kmer_start..];
         superkmers.push((kmer_min, superkmer.to_vec()));
       
-        kmer_counter.submit(superkmers);
-
-        
+        if superkmers.len() > 1024 * 64 {
+            kmer_counter.submit(superkmers);
+            superkmers = Vec::with_capacity(1024 * 64);
+        }
     }
+
+    kmer_counter.submit(superkmers);
 }
