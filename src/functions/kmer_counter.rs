@@ -1,10 +1,10 @@
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
 use dashmap::DashMap;
 use needletail::{Sequence, parse_fastx_reader};
-use pulp::Arch;
-use xxhash_rust::xxh3::xxh3_64;
-use rayon::prelude::*;
 use nthash::NtHashIterator;
+use pulp::Arch;
+use rayon::prelude::*;
+use xxhash_rust::xxh3::xxh3_64;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -202,7 +202,11 @@ impl KmerCounter {
 
         let mut counts: DashMap<Vec<u8>, u32> = DashMap::new();
 
-        let bins = bins.drain(..).into_iter().map(|x| (x.number, x.filename)).collect::<Vec<_>>();
+        let bins = bins
+            .drain(..)
+            .into_iter()
+            .map(|x| (x.number, x.filename))
+            .collect::<Vec<_>>();
 
         // Using rayon, merge the bins
         bins.into_par_iter().for_each(|(number, filename)| {
@@ -239,15 +243,13 @@ impl KmerCounter {
 
                 for kmer in kmers {
                     if counts.contains_key(&kmer) {
-                        counts.alter(&kmer, |_, count| {
-                            count.saturating_add(1)
-                        });
+                        counts.alter(&kmer, |_, count| count.saturating_add(1));
                     } else {
                         counts.insert(kmer, 1);
-                    }                    
+                    }
                 }
-            }});
-
+            }
+        });
 
         println!("Counts: {:?}", counts.len());
         // Convert dashmap into a hashmap
@@ -255,17 +257,16 @@ impl KmerCounter {
 
         // Save to file
         let mut out_fh = BufWriter::new(
-            File::create(format!("{}/counts.bin", temp_path)).expect("Could not create counts file"),
+            File::create(format!("{}/counts.bin", temp_path))
+                .expect("Could not create counts file"),
         );
 
         bincode::encode_into_std_write(
             counts,
             &mut out_fh,
             bincode::config::standard().with_fixed_int_encoding(),
-        ).expect("Could not write to counts file");
-
-
-
+        )
+        .expect("Could not write to counts file");
     }
 }
 
@@ -280,9 +281,10 @@ fn kmer_worker(
     bin_power: u8,
 ) {
     let bin_mask = (1 << bin_power) - 1;
-    const FLUSH_THRESHOLD: usize = 16384;
+    const LOCAL_FLUSH_THRESHOLD: usize = 16384;
+    const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
 
-        let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
+    let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
 
     // did not seem to help
     // compressor.set_parameter(zstd::stream::raw::CParameter::Strategy(zstd::zstd_safe::zstd_sys::ZSTD_strategy::ZSTD_fast)).expect("Could not set compression level");
@@ -290,10 +292,8 @@ fn kmer_worker(
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
     let mut local_buffers: Vec<Vec<Vec<u8>>> = (0..bin_count)
-        .map(|_| Vec::with_capacity(FLUSH_THRESHOLD))
+        .map(|_| Vec::with_capacity(LOCAL_FLUSH_THRESHOLD))
         .collect();
-
-    let mut bins_to_submit = Vec::with_capacity(128);
 
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -346,54 +346,33 @@ fn kmer_worker(
         };
 
         // For each kmer, calculate the bin and store it in the corresponding local buffer.
-        for (minimizer, kmer) in kmers {
+        for (minimizer, kmer) in kmers.into_iter() {
             let hash = xxh3_64(&minimizer.to_ne_bytes());
             let bin = hash & bin_mask;
             let bin_index = bin as usize;
 
             local_buffers[bin_index].push(kmer);
-
-            // If the thread-local buffer has reached the threshold, flush it.
-            if local_buffers[bin_index].len() >= FLUSH_THRESHOLD {
-                // Acquire the lock for the global bin buffer.
-                let mut global_buffer = bins[bin_index]
-                    .buffer
-                    .lock()
-                    .expect("Could not acquire bin lock");
-                // Move the local buffer's contents into the global buffer.
-                global_buffer.append(&mut local_buffers[bin_index]);
-                // Optionally, mark for flush if the global buffer exceeds its flush size.
-                if global_buffer.len() > bins[bin_index].buffer_flush_size {
-                    bins_to_submit.push(bin_index);
-                }
-            }
         }
 
-        if !bins_to_submit.is_empty()
-            && compression_rx.len() as f32 <= 0.8 * compression_rx.capacity().unwrap() as f32
-        {
-            for bin in bins_to_submit.drain(..) {
-                let mut bin_lock = match bins[bin].buffer.try_lock() {
-                    Ok(lock) => lock,
-                    Err(_) => continue, // Assume another thread is flushing this buffer
-                };
+        // Check local buffers
+        for (bin_index, local_buf) in local_buffers.iter_mut().enumerate() {
+            if local_buf.len() >= LOCAL_FLUSH_THRESHOLD {
+                let mut bin_lock = bins[bin_index].buffer.lock().unwrap();
+                bin_lock.append(local_buf);
+                local_buf.clear();
 
                 // Confirm that another thread didn't flush it
-                if bin_lock.len() < bins[bin].buffer_flush_size {
-                    continue;
+                if bin_lock.len() > GLOBAL_FLUSH_THRESHOLD {
+                    let mut bin_buffer = Vec::with_capacity(bin_lock.len());
+                    std::mem::swap(&mut *bin_lock, &mut bin_buffer);
+                    drop(bin_lock);
+
+                    compression_tx
+                        .send((bin_index, bin_buffer))
+                        .expect("Could not send buffer to compressor");
                 }
-
-                let mut bin_buffer = Vec::with_capacity(bin_lock.len());
-                std::mem::swap(&mut *bin_lock, &mut bin_buffer);
-                drop(bin_lock);
-
-                compression_tx
-                    .send((bin, bin_buffer))
-                    .expect("Could not send buffer to compressor");
             }
         }
-
-        bins_to_submit.clear();
     }
 
     // Final flush: after shutdown, flush any remaining items from the thread-local buffers.
@@ -423,7 +402,6 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
     let mut reader = parse_fastx_reader(reader).expect("Invalid file");
 
     let mut superkmers = Vec::new();
-
 
     // debugging
     let mut processed_reads = 0;
@@ -473,21 +451,24 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         let mut superkmers_count = 0;
         let mut total_kmers = 0;
 
-        let mut kmer_min = NtHashIterator::new(&kmers.next().unwrap().1, 7).expect("Could not create NtHashIterator").min().expect("Could not get min");
+        let mut kmer_min = NtHashIterator::new(&kmers.next().unwrap().1, 7)
+            .expect("Could not create NtHashIterator")
+            .min()
+            .expect("Could not get min");
         let mut superkmer_start_kmer_start = 0;
 
         for (i, kmer, rc) in kmers {
             total_kmers += 1;
             let iter = NtHashIterator::new(&kmer, 7).expect("Could not create NtHashIterator");
             let min = iter.min().expect("Could not get min");
-            
+
             if min != kmer_min {
                 // superkmers.push((superkmer_start_pos, pos, kmer_min, rc));
 
                 // Get the actual sequence / superkmer
-                let superkmer = &seq[superkmer_start_kmer_start..i+k as usize];
+                let superkmer = &seq[superkmer_start_kmer_start..i + k as usize];
                 superkmers.push((kmer_min, superkmer.to_vec()));
-                
+
                 // Insert and all that
                 kmer_min = min;
                 superkmer_start_kmer_start = i;
@@ -498,10 +479,10 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
         // Last one
         let superkmer = &seq[superkmer_start_kmer_start..];
         superkmers.push((kmer_min, superkmer.to_vec()));
-      
-        if superkmers.len() > 1024 * 64 {
+
+        if superkmers.len() > 64 * 1024 {
             kmer_counter.submit(superkmers);
-            superkmers = Vec::with_capacity(1024 * 64);
+            superkmers = Vec::with_capacity(64 * 1024);
         }
     }
 
