@@ -17,6 +17,11 @@ use std::thread::{self, JoinHandle};
 const LOCAL_FLUSH_THRESHOLD: usize = 16384;
 const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
 
+// TODO: This is where I'm leaving off
+// Need a way to store kmers as offsets rather than the actual sequence
+// Maybe precompute bins and store the bin number and offset in the bin as well?
+pub type SuperKmer = (u64, Vec<u8>, Vec<u8>);
+
 pub struct KmerCounter {
     k: u8,
     temp_path: String,
