@@ -23,10 +23,10 @@ pub struct KmerCounter {
     bin_count: u16,
     threads: usize,
     workers: Vec<JoinHandle<()>>,
-    kmer_tx: Sender<Vec<u64>>,
-    kmer_rx: Receiver<Vec<u64>>,
-    compression_tx: Sender<(usize, Vec<u64>)>,
-    compression_rx: Receiver<(usize, Vec<u64>)>,
+    kmer_tx: Sender<Vec<(u64, Vec<u8>)>>,
+    kmer_rx: Receiver<Vec<(u64, Vec<u8>)>>,
+    compression_tx: Sender<(usize, Vec<Vec<u8>>)>,
+    compression_rx: Receiver<(usize, Vec<Vec<u8>>)>,
     output_tx: Sender<(usize, Vec<u8>)>,
     output_rx: Receiver<(usize, Vec<u8>)>,
     shutdown_flag: Arc<AtomicBool>,
@@ -86,11 +86,8 @@ impl KmerCounter {
         let bins = Arc::new(bins);
 
         // Create the channels
-        let (kmer_tx, kmer_rx): (Sender<Vec<u64>>, Receiver<Vec<u64>>) = bounded(64);
-        let (compression_tx, compression_rx): (
-            Sender<(usize, Vec<u64>)>,
-            Receiver<(usize, Vec<u64>)>,
-        ) = bounded(64);
+        let (kmer_tx, kmer_rx) = bounded(64);
+        let (compression_tx, compression_rx) = bounded(64);
         let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) =
             unbounded();
 
@@ -137,7 +134,7 @@ impl KmerCounter {
         }
     }
 
-    pub fn submit(&self, kmers: Vec<u64>) {
+    pub fn submit(&self, kmers: Vec<(u64, Vec<u8>)>) {
         self.kmer_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
@@ -145,8 +142,8 @@ impl KmerCounter {
 
     pub fn try_submit(
         &self,
-        kmers: Vec<u64>,
-    ) -> Result<(), crossbeam::channel::TrySendError<Vec<u64>>> {
+        kmers: Vec<(u64, Vec<u8>)>,
+    ) -> Result<(), crossbeam::channel::TrySendError<Vec<(u64, Vec<u8>)>>> {
         self.kmer_tx.try_send(kmers)
     }
 
@@ -203,7 +200,7 @@ impl KmerCounter {
 
         let mut bins = Arc::into_inner(bins).expect("Could not get bins");
 
-        let mut counts: DashMap<u64, u32> = DashMap::new();
+        let mut counts: DashMap<Vec<u8>, u32> = DashMap::new();
 
         let bins = bins.drain(..).into_iter().map(|x| (x.number, x.filename)).collect::<Vec<_>>();
 
@@ -236,7 +233,7 @@ impl KmerCounter {
                 let kmers = decompressor
                     .decompress(&kmers, 8 * 1024 * 1024 * 1024)
                     .expect("Could not decompress buffer");
-                let kmers: Vec<u64> = bincode::decode_from_slice(&kmers, bincode_config)
+                let kmers: Vec<Vec<u8>> = bincode::decode_from_slice(&kmers, bincode_config)
                     .expect("Could not decode buffer")
                     .0;
 
@@ -254,7 +251,7 @@ impl KmerCounter {
 
         println!("Counts: {:?}", counts.len());
         // Convert dashmap into a hashmap
-        let counts: HashMap<u64, u32> = counts.into_iter().map(|(k, v)| (k, v)).collect();
+        let counts: HashMap<Vec<u8>, u32> = counts.into_iter().map(|(k, v)| (k, v)).collect();
 
         // Save to file
         let mut out_fh = BufWriter::new(
@@ -273,9 +270,9 @@ impl KmerCounter {
 }
 
 fn kmer_worker(
-    kmer_rx: crossbeam::channel::Receiver<Vec<u64>>,
-    compression_rx: crossbeam::channel::Receiver<(usize, Vec<u64>)>,
-    compression_tx: crossbeam::channel::Sender<(usize, Vec<u64>)>,
+    kmer_rx: crossbeam::channel::Receiver<Vec<(u64, Vec<u8>)>>,
+    compression_rx: crossbeam::channel::Receiver<(usize, Vec<Vec<u8>>)>,
+    compression_tx: crossbeam::channel::Sender<(usize, Vec<Vec<u8>>)>,
     output_rx: crossbeam::channel::Receiver<(usize, Vec<u8>)>,
     output_tx: crossbeam::channel::Sender<(usize, Vec<u8>)>,
     shutdown_flag: Arc<AtomicBool>,
@@ -292,7 +289,7 @@ fn kmer_worker(
 
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
-    let mut local_buffers: Vec<Vec<u64>> = (0..bin_count)
+    let mut local_buffers: Vec<Vec<Vec<u8>>> = (0..bin_count)
         .map(|_| Vec::with_capacity(FLUSH_THRESHOLD))
         .collect();
 
@@ -349,8 +346,8 @@ fn kmer_worker(
         };
 
         // For each kmer, calculate the bin and store it in the corresponding local buffer.
-        for kmer in kmers {
-            let hash = xxh3_64(&kmer.to_ne_bytes());
+        for (minimizer, kmer) in kmers {
+            let hash = xxh3_64(&minimizer.to_ne_bytes());
             let bin = hash & bin_mask;
             let bin_index = bin as usize;
 
@@ -415,7 +412,7 @@ pub struct KmerBin {
     number: u16,
     out_fh: Mutex<BufWriter<std::fs::File>>,
     filename: String,
-    buffer: Mutex<Vec<u64>>,
+    buffer: Mutex<Vec<Vec<u8>>>,
     buffer_flush_size: usize,
 }
 
@@ -488,7 +485,7 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
 
                 // Get the actual sequence / superkmer
                 let superkmer = &seq[superkmer_start_kmer_start..i+k as usize];
-                superkmers.push(superkmer);
+                superkmers.push((kmer_min, superkmer.to_vec()));
                 
                 // Insert and all that
                 kmer_min = min;
@@ -499,14 +496,10 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
 
         // Last one
         let superkmer = &seq[superkmer_start_kmer_start..];
-        superkmers.push(superkmer);
+        superkmers.push((kmer_min, superkmer.to_vec()));
       
-        println!("Superkmers: {}", superkmers_count);
-        println!("Total kmers: {}", total_kmers);
-        println!("Superkmers raw: {:?}", superkmers);
+        kmer_counter.submit(superkmers);
 
-        // Only process one for DEBUGGING
-        return;
-
+        
     }
 }
