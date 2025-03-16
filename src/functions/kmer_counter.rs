@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::rolling_encoder::RollingKmer3;
+const LOCAL_FLUSH_THRESHOLD: usize = 16384;
+const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
 
 pub struct KmerCounter {
     k: u8,
@@ -37,7 +38,6 @@ impl KmerCounter {
         k: u8,
         temp_path: String,
         threads: usize,
-        buffer_flush_size: usize,
         bin_power: u8,
     ) -> Self {
         assert!(k < 32, "Kmer size must be less than 32");
@@ -78,8 +78,7 @@ impl KmerCounter {
                 number: i as u16,
                 filename: bin_path,
                 out_fh,
-                buffer: Mutex::new(Vec::with_capacity(buffer_flush_size)),
-                buffer_flush_size,
+                buffer: Mutex::new(Vec::with_capacity(GLOBAL_FLUSH_THRESHOLD)),
             });
         }
 
@@ -281,9 +280,6 @@ fn kmer_worker(
     bin_power: u8,
 ) {
     let bin_mask = (1 << bin_power) - 1;
-    const LOCAL_FLUSH_THRESHOLD: usize = 16384;
-    const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
-
     let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
 
     // did not seem to help
@@ -331,11 +327,11 @@ fn kmer_worker(
 
                 // no compression
                 // No real speed difference...
-                // let compressed = encoded;
+                let compressed = encoded;
 
-                output_tx
-                    .send((bin, compressed))
-                    .expect("Could not send compressed buffer to flusher");
+                // output_tx
+                    // .send((bin, compressed))
+                    // .expect("Could not send compressed buffer to flusher");
             }
         }
 
@@ -392,7 +388,6 @@ pub struct KmerBin {
     out_fh: Mutex<BufWriter<std::fs::File>>,
     filename: String,
     buffer: Mutex<Vec<Vec<u8>>>,
-    buffer_flush_size: usize,
 }
 
 // kmers up to 31 bases long
