@@ -309,7 +309,7 @@ fn kmer_worker(
 
         if !output_rx.is_full() {
             while let Ok((bin, mut kmers)) = compression_rx.try_recv() {
-                kmers.sort_unstable();
+                // kmers.sort_unstable();
 
                 let encoded = bincode::encode_to_vec(
                     &kmers,
@@ -327,11 +327,11 @@ fn kmer_worker(
 
                 // no compression
                 // No real speed difference...
-                let compressed = encoded;
+                // let compressed = encoded;
 
-                // output_tx
-                    // .send((bin, compressed))
-                    // .expect("Could not send compressed buffer to flusher");
+                output_tx
+                    .send((bin, compressed))
+                    .expect("Could not send compressed buffer to flusher");
             }
         }
 
