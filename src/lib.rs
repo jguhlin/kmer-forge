@@ -1,10 +1,10 @@
 mod functions;
-mod utils;
 mod structs;
+mod utils;
 
 pub use functions::*;
-pub use utils::*;
 pub use structs::*;
+pub use utils::*;
 
 #[cfg(test)]
 mod tests {

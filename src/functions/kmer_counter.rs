@@ -1,11 +1,13 @@
+use bytes::{Buf, BufMut, Bytes};
 use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
 use dashmap::DashMap;
-use needletail::{Sequence, parse_fastx_reader};
+use needletail::{kmer, parse_fastx_reader, Sequence};
 use nthash::NtHashIterator;
 use pulp::Arch;
 use rayon::prelude::*;
+use simd_minimizers::one_minimizer;
+use simd_minimizers::packed_seq::AsciiSeq;
 use xxhash_rust::xxh3::xxh3_64;
-use bytes::Bytes;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -17,8 +19,8 @@ use std::thread::{self, JoinHandle};
 
 use crate::SuperKmerStorage;
 
-const LOCAL_FLUSH_THRESHOLD: usize = 16384;
-const GLOBAL_FLUSH_THRESHOLD: usize = 256 * 1024;
+const LOCAL_FLUSH_THRESHOLD: usize = 8 * 1024;
+const GLOBAL_FLUSH_THRESHOLD: usize = 32 * 1024;
 
 // TODO: This is where I'm leaving off
 // Need a way to store kmers as offsets rather than the actual sequence
@@ -27,11 +29,14 @@ pub type SuperKmer = (u64, Vec<u8>, Vec<u8>);
 
 pub struct KmerCounter {
     k: u8,
+    min_quality: u8,
     temp_path: String,
     bins: Arc<Vec<KmerBin>>,
     bin_count: u16,
     threads: usize,
     workers: Vec<JoinHandle<()>>,
+    reads_tx: Sender<Vec<(Bytes, Option<Bytes>)>>,
+    reads_rx: Receiver<Vec<(Bytes, Option<Bytes>)>>,
     kmer_tx: Sender<Vec<(u64, Bytes)>>,
     kmer_rx: Receiver<Vec<(u64, Bytes)>>,
     compression_tx: Sender<(usize, SuperKmerStorage)>,
@@ -42,12 +47,7 @@ pub struct KmerCounter {
 }
 
 impl KmerCounter {
-    pub fn new(
-        k: u8,
-        temp_path: String,
-        threads: usize,
-        bin_power: u8,
-    ) -> Self {
+    pub fn new(k: u8, temp_path: String, threads: usize, bin_power: u8, min_quality: u8) -> Self {
         assert!(k < 32, "Kmer size must be less than 32");
         let bin_count: usize = 2_usize.pow(bin_power as u32);
         assert!(bin_count > 0, "Bin count must be greater than 0");
@@ -86,23 +86,29 @@ impl KmerCounter {
                 number: i as u16,
                 filename: bin_path,
                 out_fh,
-                buffer: Mutex::new(SuperKmerStorage::new()),
+                buffer: Mutex::new(SuperKmerStorage::with_capacity(
+                    GLOBAL_FLUSH_THRESHOLD,
+                    k as usize,
+                )),
             });
         }
 
         let bins = Arc::new(bins);
 
         // Create the channels
-        let (kmer_tx, kmer_rx) = bounded(64);
-        let (compression_tx, compression_rx) = bounded(64);
+        let (reads_tx, reads_rx) = bounded(threads + 4);
+        let (kmer_tx, kmer_rx) = bounded(threads + 4);
+        let (compression_tx, compression_rx) = bounded(threads + 4);
         let (output_tx, output_rx): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) =
-            unbounded();
+            bounded(threads + 4);
 
         // Create the workers
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
+            let reads_rx = reads_rx.clone();
             let kmer_rx = kmer_rx.clone();
+            let kmer_tx = kmer_tx.clone();
             let compression_tx = compression_tx.clone();
             let compression_rx = compression_rx.clone();
             let output_tx = output_tx.clone();
@@ -111,6 +117,8 @@ impl KmerCounter {
             let bins = bins.clone();
             let worker = thread::spawn(move || {
                 kmer_worker(
+                    reads_rx,
+                    kmer_tx,
                     kmer_rx,
                     compression_rx,
                     compression_tx,
@@ -119,6 +127,9 @@ impl KmerCounter {
                     shutdown_flag,
                     bins,
                     bin_power,
+                    k,
+                    min_quality,
+                    threads,
                 );
             });
             workers.push(worker);
@@ -138,11 +149,14 @@ impl KmerCounter {
             compression_rx,
             output_tx,
             output_rx,
+            reads_tx,
+            reads_rx,
+            min_quality,
         }
     }
 
-    pub fn submit(&self, kmers: Vec<(u64, Bytes)>) {
-        self.kmer_tx
+    pub fn submit(&self, kmers: Vec<(Bytes, Option<Bytes>)>) {
+        self.reads_tx
             .send(kmers)
             .expect("Could not send kmers to worker");
     }
@@ -199,9 +213,7 @@ impl KmerCounter {
         // Drain the bins, destruct, close the out_fh and open the file for reading instead
 
         let KmerCounter {
-            temp_path,
-            bins,
-            ..
+            temp_path, bins, ..
         } = self;
 
         let mut bins = Arc::into_inner(bins).expect("Could not get bins");
@@ -277,6 +289,8 @@ impl KmerCounter {
 }
 
 fn kmer_worker(
+    reads_rx: crossbeam::channel::Receiver<Vec<(Bytes, Option<Bytes>)>>,
+    kmer_tx: crossbeam::channel::Sender<Vec<(u64, Bytes)>>,
     kmer_rx: crossbeam::channel::Receiver<Vec<(u64, Bytes)>>,
     compression_rx: crossbeam::channel::Receiver<(usize, SuperKmerStorage)>,
     compression_tx: crossbeam::channel::Sender<(usize, SuperKmerStorage)>,
@@ -285,9 +299,16 @@ fn kmer_worker(
     shutdown_flag: Arc<AtomicBool>,
     bins: Arc<Vec<KmerBin>>,
     bin_power: u8,
+    k: u8,
+    min_quality: u8,
+    threads: usize,
 ) {
     let bin_mask = (1 << bin_power) - 1;
     let mut compressor = zstd::bulk::Compressor::new(-3).expect("Could not create compressor");
+
+    let mut kmer_messages = Vec::new();
+    let mut compression_messages = Vec::new();
+    let mut output_messages = Vec::new();
 
     // did not seem to help
     // compressor.set_parameter(zstd::stream::raw::CParameter::Strategy(zstd::zstd_safe::zstd_sys::ZSTD_strategy::ZSTD_fast)).expect("Could not set compression level");
@@ -295,10 +316,16 @@ fn kmer_worker(
     // Create a thread-local buffer for each bin.
     let bin_count = bins.len();
     let mut local_buffers: Vec<SuperKmerStorage> = (0..bin_count)
-        .map(|_| SuperKmerStorage::new())
+        .map(|_| SuperKmerStorage::with_capacity(LOCAL_FLUSH_THRESHOLD, k as usize))
         .collect();
 
+    let mut superkmers = Vec::with_capacity(128 * 1024);
+
+    let mut did_work;
+
     loop {
+        did_work = false;
+
         if shutdown_flag.load(Ordering::Relaxed) {
             break;
         }
@@ -312,11 +339,12 @@ fn kmer_worker(
             )
             .expect("Could not write to bin file");
             drop(bin_lock);
+            did_work = true;
         }
 
-        if !output_rx.is_full() {
-            while let Ok((bin, kmers)) = compression_rx.try_recv() {
-                // kmers.sort_unstable();
+        if output_messages.is_empty() {
+            if let Ok((bin, kmers)) = compression_rx.try_recv() {
+                did_work = true;
 
                 let encoded = bincode::encode_to_vec(
                     &kmers,
@@ -336,45 +364,186 @@ fn kmer_worker(
                 // No real speed difference...
                 // let compressed = encoded;
 
-                output_tx
-                    .send((bin, compressed))
-                    .expect("Could not send compressed buffer to flusher");
+                // output_tx
+                // .send((bin, compressed))
+                // .expect("Could not send compressed buffer to flusher");
+
+                output_messages.push((bin, compressed));
             }
         }
 
-        let kmers = match kmer_rx.try_recv() {
-            Err(crossbeam::channel::TryRecvError::Empty) => continue,
-            Err(crossbeam::channel::TryRecvError::Disconnected) => break,
-            Ok(kmers) => kmers,
-        };
+        if compression_messages.is_empty() {
+            if let Ok(kmers) = kmer_rx.try_recv() {
+                did_work = true;
 
-        // For each kmer, calculate the bin and store it in the corresponding local buffer.
-        for (minimizer, kmer) in kmers.into_iter() {
-            let hash = xxh3_64(&minimizer.to_ne_bytes());
-            let bin = hash & bin_mask;
-            let bin_index = bin as usize;
+                let mut buffers_to_check = std::collections::HashSet::new();
 
-            local_buffers[bin_index].add_superkmer(&kmer);
-        }
+                // For each kmer, calculate the bin and store it in the corresponding local buffer.
+                for (minimizer, kmer) in kmers.into_iter() {
+                    let hash = xxh3_64(&minimizer.to_ne_bytes());
+                    let bin = hash & bin_mask;
+                    let bin_index = bin as usize;
 
-        // Check local buffers
-        for (bin_index, local_buf) in local_buffers.iter_mut().enumerate() {
-            if local_buf.len() >= LOCAL_FLUSH_THRESHOLD {
-                let mut bin_lock = bins[bin_index].buffer.lock().unwrap();
-                bin_lock.append(local_buf);
-                local_buf.clear();
+                    local_buffers[bin_index].add_superkmer(&kmer);
+                    buffers_to_check.insert(bin_index);
+                }
 
-                // Confirm that another thread didn't flush it
-                if bin_lock.len() > GLOBAL_FLUSH_THRESHOLD {
-                    let mut bin_buffer = SuperKmerStorage::new();
-                    std::mem::swap(&mut *bin_lock, &mut bin_buffer);
-                    drop(bin_lock);
+                // Check local buffers
+                for bin_index in buffers_to_check.drain() {
+                    let local_buf = &mut local_buffers[bin_index];
+                    if local_buf.len() >= LOCAL_FLUSH_THRESHOLD {
+                        let mut bin_lock = bins[bin_index].buffer.lock().unwrap();
+                        bin_lock.append(local_buf);
 
-                    compression_tx
-                        .send((bin_index, bin_buffer))
-                        .expect("Could not send buffer to compressor");
+                        if bin_lock.len() > GLOBAL_FLUSH_THRESHOLD {
+                            let mut bin_buffer =
+                                SuperKmerStorage::with_capacity(GLOBAL_FLUSH_THRESHOLD, k as usize);
+                            std::mem::swap(&mut *bin_lock, &mut bin_buffer);
+                            drop(bin_lock);
+
+                            compression_messages.push((bin_index, bin_buffer));
+                        }
+                    }
                 }
             }
+        }
+
+        if kmer_messages.is_empty() {
+            if let Ok(reads) = reads_rx.try_recv() {
+                did_work = true;
+
+                for (mut seq, qual) in reads {
+                    if let Some(qual) = qual {
+                        // If average is less than min_quality, skip
+                        let total_qual: u64 = qual.iter().map(|q| *q as u64).sum();
+                        if (total_qual / qual.len() as u64) < min_quality as u64 {
+                            continue;
+                        }
+
+                        // Otherwise mask sequence when quality is less than min_quality
+
+                        let masked_seq: Bytes = seq
+                            .iter()
+                            .zip(qual.iter())
+                            .map(|(base, q)| if q < &min_quality { b'N' } else { *base })
+                            .collect();
+
+                        seq = masked_seq;
+                    } // If no quality, we don't worry about it
+
+                    if seq.len() < k as usize {
+                        continue;
+                    }
+
+                    let seq = seq.strip_returns();
+                    let seq = seq.normalize(true);
+                    let rc = seq.reverse_complement();
+
+                    let seq = Bytes::from(seq.into_owned());
+                    let rc = Bytes::from(rc);
+
+                    let mut kmers = seq.canonical_kmers(k, &rc);
+
+                    let mut superkmers_count = 0;
+                    let mut total_kmers = 0;
+
+                    // let mut kmer_min = NtHashIterator::new(&kmers.next().unwrap().1, 7)
+                    // .expect("Could not create NtHashIterator")
+                    // .min()
+                    // .expect("Could not get min");
+
+                    let mut superkmer_start_kmer_start = 0;
+
+                    // let kmer_min = one_minimizer(AsciiSeq(&kmers.next().unwrap().1), 7);
+                    let mut kmer_min = one_minimizer_filtered(&kmers.next().unwrap().1, 7);
+                    // let mut kmer_min = seq.slice(kmer_min..kmer_min + 7);
+
+                    for (i, kmer, rc) in kmers {
+                        total_kmers += 1;
+                        // let iter = NtHashIterator::new(&kmer, 7).expect("Could not create NtHashIterator");
+                        // let min = iter.min().expect("Could not get min");
+                        // let min = one_minimizer(AsciiSeq(&kmer), 7);
+                        // let min = seq.slice(min..min + 7);
+                        let min = one_minimizer_filtered(&kmer, 7);
+
+                        if min != kmer_min {
+                            // superkmers.push((superkmer_start_pos, pos, kmer_min, rc));
+
+                            // Get the actual sequence / superkmer
+                            // let superkmer = &seq[superkmer_start_kmer_start..i + k as usize];
+                            let superkmer = seq.slice(superkmer_start_kmer_start..i + k as usize);
+                            superkmers.push((kmer_min, superkmer));
+
+                            // Insert and all that
+                            kmer_min = min;
+                            superkmer_start_kmer_start = i;
+                            superkmers_count += 1;
+                        }
+                    }
+
+                    // Last one
+                    let superkmer = seq.slice(superkmer_start_kmer_start..);
+                    superkmers.push((kmer_min, superkmer));
+
+                    if superkmers.len() > 64 * 1024 {
+                        kmer_messages.push(superkmers);
+                        superkmers = Vec::with_capacity(64 * 1024);
+                    }
+                }
+            }
+        }
+
+        if output_tx.len() < threads && !output_messages.is_empty() {
+            // Prepare a temporary vector to hold messages that couldn’t be sent.
+            let mut unsent_messages = Vec::with_capacity(output_messages.len());
+            // Drain moves each element out without cloning.
+            for message in output_messages.drain(..) {
+                if let Err(crossbeam::channel::TrySendError::Full(message)) =
+                    output_tx.try_send(message)
+                {
+                    // If the send fails (e.g. channel is full), push the message back.
+                    unsent_messages.push(message);
+                }
+            }
+            // Replace the original queue with the unsent messages.
+            output_messages = unsent_messages;
+        }
+
+        if compression_tx.len() < threads && !compression_messages.is_empty() {
+            // Prepare a temporary vector to hold messages that couldn’t be sent.
+            let mut unsent_messages = Vec::with_capacity(compression_messages.len());
+            // Drain moves each element out without cloning.
+            for message in compression_messages.drain(..) {
+                if let Err(crossbeam::channel::TrySendError::Full(message)) =
+                    compression_tx.try_send(message)
+                {
+                    // If the send fails (e.g. channel is full), push the message back.
+                    unsent_messages.push(message);
+                }
+            }
+            // Replace the original queue with the unsent messages.
+            compression_messages = unsent_messages;
+        }
+
+        if kmer_tx.len() < threads && !kmer_messages.is_empty() {
+            // Prepare a temporary vector to hold messages that couldn’t be sent.
+            let mut unsent_messages = Vec::with_capacity(kmer_messages.len());
+            // Drain moves each element out without cloning.
+            for message in kmer_messages.drain(..) {
+                if let Err(crossbeam::channel::TrySendError::Full(message)) =
+                    kmer_tx.try_send(message)
+                {
+                    // If the send fails (e.g. channel is full), push the message back.
+                    unsent_messages.push(message);
+                }
+            }
+            // Replace the original queue with the unsent messages.
+            kmer_messages = unsent_messages;
+        }
+
+        if !did_work {
+            println!("Worker sleeping - {} {} {} {} - {} {} {}", reads_rx.len(), kmer_tx.len(), compression_tx.len(), output_tx.len(), kmer_messages.len(), compression_messages.len(), output_messages.len());
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
@@ -400,10 +569,12 @@ pub struct KmerBin {
 // kmers up to 31 bases long
 pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_quality: u8) {
     let file = File::open(file).expect("Could not open file");
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut reader = parse_fastx_reader(reader).expect("Invalid file");
 
-    let mut superkmers = Vec::new();
+    const FLUSH_BUFFER: usize = 16 * 1024;
+
+    let mut reads = Vec::with_capacity(FLUSH_BUFFER);
 
     // debugging
     let mut processed_reads = 0;
@@ -416,95 +587,80 @@ pub fn count_kmers_file(kmer_counter: &mut KmerCounter, file: &str, k: u8, min_q
             println!("Processed {} reads", processed_reads);
         }
         let record = record.expect("Error reading record");
-        let mut seq = record.seq();
+        let seq = record.seq();
         let qual = record.qual();
 
-        let arch = Arch::new();
-
-        if let Some(qual) = qual {
-            // If average is less than min_quality, skip
-            let total_qual: u64 = qual.iter().map(|q| *q as u64).sum();
-            if (total_qual / qual.len() as u64) < min_quality as u64 {
-                continue;
-            }
-
-            // Otherwise mask sequence when quality is less than min_quality
-
-            let masked_seq: Vec<u8> = arch.dispatch(|| {
-                seq.iter()
-                    .zip(qual.iter())
-                    .map(|(base, q)| if q < &min_quality { b'N' } else { *base })
-                    .collect()
-            });
-
-            seq = Cow::Owned(masked_seq);
-        } // If no quality, we don't worry about it
-
-        // Is seq long enough to have a kmer?
-        if seq.len() < k as usize {
-            continue;
-        }
-
-        let seq = seq.strip_returns();
-        let seq = seq.normalize(true);
-        let rc = seq.reverse_complement();
+        let qual = if let Some(qual) = qual {
+            Some(Bytes::from(qual.to_vec()))
+        } else {
+            None
+        };
 
         let seq = Bytes::from(seq.into_owned());
-        let rc = Bytes::from(rc);
 
-        let mut kmers = seq.canonical_kmers(k, &rc);
+        reads.push((seq, qual));
 
-
-        let mut superkmers_count = 0;
-        let mut total_kmers = 0;
-
-        let mut kmer_min = NtHashIterator::new(&kmers.next().unwrap().1, 7)
-            .expect("Could not create NtHashIterator")
-            .min()
-            .expect("Could not get min");
-        let mut superkmer_start_kmer_start = 0;
-
-        for (i, kmer, rc) in kmers {
-            total_kmers += 1;
-            let iter = NtHashIterator::new(&kmer, 7).expect("Could not create NtHashIterator");
-            let min = iter.min().expect("Could not get min");
-
-            if min != kmer_min {
-                // superkmers.push((superkmer_start_pos, pos, kmer_min, rc));
-
-                // Get the actual sequence / superkmer
-                // let superkmer = &seq[superkmer_start_kmer_start..i + k as usize];
-                let superkmer = seq.slice(superkmer_start_kmer_start..i + k as usize);
-                superkmers.push((kmer_min, superkmer));
-
-                // Insert and all that
-                kmer_min = min;
-                superkmer_start_kmer_start = i;
-                superkmers_count += 1;
-            }
-        }
-
-        // Last one
-        // let superkmer = &seq[superkmer_start_kmer_start..];
-        let superkmer = seq.slice(superkmer_start_kmer_start..);
-        superkmers.push((kmer_min, superkmer));
-
-        if superkmers.len() > 64 * 1024 {
-            match kmer_counter.try_submit(superkmers) {
-                Ok(()) => {
-                    superkmers = Vec::with_capacity(64 * 1024);
-                }
-                Err(crossbeam::channel::TrySendError::Full(kmers)) => {
-                    println!("Kmer Channel Full");
-                    superkmers = kmers;
-                }
-                Err(crossbeam::channel::TrySendError::Disconnected(kmers)) => {
-                    superkmers = kmers;
-                    break;
-                }
-            }
+        if reads.len() >= FLUSH_BUFFER {
+            kmer_counter.submit(reads);
+            reads = Vec::with_capacity(FLUSH_BUFFER);
         }
     }
 
-    kmer_counter.submit(superkmers);
+    if !reads.is_empty() {
+        kmer_counter.submit(reads);
+    }
+}
+
+#[inline(always)]
+pub fn one_minimizer_filtered(seq: &[u8], m: usize) -> u64 {
+    assert!(seq.len() >= m, "Sequence length must be at least m");
+
+    // Precompute 256^(m-1) to remove the contribution of the dropped byte.
+    let multiplier = 256u64.pow((m - 1) as u32);
+
+    // Compute the candidate for the first window.
+    let mut candidate = seq.iter().take(m).fold(0u64, |acc, &b| (acc << 8) | b as u64);
+    let mut best_overall = candidate;
+    let mut best_filtered: Option<u64> = if passes_rules(candidate, m) {
+        Some(candidate)
+    } else {
+        None
+    };
+
+    // Slide the window over the sequence, updating the candidate in O(1) time.
+    for i in 1..=seq.len() - m {
+        candidate = (candidate - (seq[i - 1] as u64) * multiplier) * 256 + seq[i + m - 1] as u64;
+        best_overall = best_overall.min(candidate);
+        if passes_rules(candidate, m) {
+            best_filtered = Some(match best_filtered {
+                Some(current) => current.min(candidate),
+                None => candidate,
+            });
+        }
+    }
+
+    // If a candidate passed the rules, return it. Otherwise, return the overall minimizer.
+    best_filtered.unwrap_or(best_overall)
+}
+
+/// Checks whether the candidate m‑mer passes filtering rules:
+/// - It must not start with "AA"
+/// - It must not be a homopolymer (all bases identical)
+#[inline(always)]
+fn passes_rules(candidate: u64, m: usize) -> bool {
+    // Extract the first two bytes (most-significant bytes, as the candidate is big‑endian).
+    let first_two = candidate >> ((m - 2) * 8);
+    if first_two == ((b'A' as u64) << 8 | (b'A' as u64)) {
+        return false;
+    }
+
+    // Check for a homopolymer: ensure at least one base differs.
+    let first_byte = (candidate >> ((m - 1) * 8)) & 0xFF;
+    for i in 1..m {
+        let byte = (candidate >> ((m - 1 - i) * 8)) & 0xFF;
+        if byte != first_byte {
+            return true; // At least one base is different.
+        }
+    }
+    false // All bases are the same → too simple.
 }

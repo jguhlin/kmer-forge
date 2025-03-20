@@ -1,8 +1,14 @@
 use bincode::{Decode, Encode};
 
+use bytes::{Buf, BufMut, Bytes};
+
+// This works for the local, but the global should be Vec<Bytes> instead of Vec<u8> then chained at the end
+// for writing to disk
+// No need to reallocate and move the data around....
+
 #[derive(Encode, Decode)]
 pub struct SuperKmerStorage {
-    pub bytes: Vec<u8>, // Todo, convert to Bytes from tokio?
+    pub bytes: Vec<u8>,   // Todo, convert to Bytes from tokio?
     pub lengths: Vec<u8>, // TODO: Make changeable
 }
 
@@ -14,10 +20,17 @@ impl SuperKmerStorage {
         }
     }
 
+    pub fn with_capacity(threshold: usize, k: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(threshold * (k + 10)),
+            lengths: Vec::with_capacity(threshold),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.lengths.len()
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.lengths.is_empty()
     }

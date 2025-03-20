@@ -4,7 +4,7 @@ fn main() {
     let filename = "E6_22T2Y5LT3_TCTAGGCGCG-CGAAGGTTAA_L001_R1.fastq.gz";
     let k = 21;
 
-    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 32, 8);
+    let mut kmer_counter = KmerCounter::new(k, "temp".to_string(), 16, 8, 20);
 
     // todo: should be able to read files in parallel
     count_kmers_file(&mut kmer_counter, filename, k, 20);
