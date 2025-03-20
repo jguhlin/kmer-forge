@@ -1,3 +1,6 @@
+use bincode::{Decode, Encode};
+
+#[derive(Encode, Decode)]
 pub struct SuperKmerStorage {
     pub bytes: Vec<u8>, // Todo, convert to Bytes from tokio?
     pub lengths: Vec<u8>, // TODO: Make changeable
@@ -19,10 +22,19 @@ impl SuperKmerStorage {
         self.lengths.is_empty()
     }
 
-
     pub fn add_superkmer(&mut self, superkmer: &[u8]) {
         self.bytes.extend_from_slice(superkmer);
         self.lengths.push(superkmer.len() as u8);
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        self.bytes.append(&mut other.bytes);
+        self.lengths.append(&mut other.lengths);
+    }
+
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.lengths.clear();
     }
 }
 
